@@ -6,7 +6,7 @@ param(
     [switch] $ForceCheck,
     [switch] $NonInteractive,
     [switch] $Quiet,
-    [string] $AppDirectory = $PSScriptRoot
+    [string] $AppDirectory = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -25,6 +25,9 @@ $TrustedPublicKeyXml = @'
 <RSAKeyValue><Modulus>ksgLIbZif39/IxO5HhD4ZtESlhHHAkEzo5B/sfoa0fk74waCbCqwAXP0d2z3LJ7oe+qg9Nd+HH0m2RHS50berb8FcST/CqC+RMmnOxgkP7TOWeuK9DPpjjRj8Y+yfsDGfeepW+l531fgIK5JhinH7q/fFDt4H/w2Ag7afsOkQxC44CmP9/n5ecAWbvBmy+iGid3BX+V5T44yBsUDJB0QipemQ39StwQU/8edActbkuVdf3R4EF8Qz0fb6snXZSx3XHuVqz9W/TKu6YmwVohx7b73S1ZL74MyRxFCBUEDXFpKRmUu8H+E1fwGagwyl5t7MJ/vc0ICEhWUb+OQcruf5lD0IO1VonC8//F3Wn9XZdmN8t7SPxyyLlOxijvQ8aQVWLL8K/9S+0/3jYEA34H1RKYcT1cM+2UbODOHlIAW2ZRrEUIBefBsvkV9ubM86tKYNv7iUwYL9w7idO/ZmkrIbc0FcjSGV65jYFCvKMMDbuQUQrOp9wluBPW8dM8Daeu1</Modulus><Exponent>AQAB</Exponent></RSAKeyValue>
 '@
 
+if ([string]::IsNullOrWhiteSpace($AppDirectory)) {
+    $AppDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
+}
 $ResolvedAppDirectory = [System.IO.Path]::GetFullPath($AppDirectory).TrimEnd('\')
 $UserDirectory = Join-Path $ResolvedAppDirectory "user"
 $UpdateDirectory = Join-Path $UserDirectory "updates"
