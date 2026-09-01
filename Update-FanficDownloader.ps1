@@ -94,7 +94,7 @@ function Get-HttpsBytes {
     $memory = [System.IO.MemoryStream]::new()
     try {
         $response = $client.GetAsync($uri, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
-        $response.EnsureSuccessStatusCode()
+        $null = $response.EnsureSuccessStatusCode()
         if ($response.RequestMessage.RequestUri.Scheme -ne "https") {
             throw "The update download redirected outside HTTPS."
         }
