@@ -91,6 +91,10 @@ function Get-HttpsBytes {
     $client.DefaultRequestHeaders.UserAgent.ParseAdd("OnjLouis-FanficDownloader-Updater/1.0")
     $client.DefaultRequestHeaders.CacheControl = [System.Net.Http.Headers.CacheControlHeaderValue]::new()
     $client.DefaultRequestHeaders.CacheControl.NoCache = $true
+    $requestUri = [uri]$Url
+    if ($requestUri.Host -ieq "api.github.com" -and -not [string]::IsNullOrWhiteSpace($env:GH_TOKEN)) {
+        $client.DefaultRequestHeaders.Authorization = [System.Net.Http.Headers.AuthenticationHeaderValue]::new("Bearer", $env:GH_TOKEN.Trim())
+    }
     $response = $null
     $stream = $null
     $memory = [System.IO.MemoryStream]::new()

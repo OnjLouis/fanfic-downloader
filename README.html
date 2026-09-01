@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fanfic Downloader Manual</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+      line-height: 1.55;
+    }
+
+    body {
+      margin: 0;
+      background: Canvas;
+      color: CanvasText;
+    }
+
+    main {
+      width: min(52rem, calc(100% - 2rem));
+      margin: 0 auto;
+      padding: 2rem 0 4rem;
+    }
+
+    h1,
+    h2 {
+      line-height: 1.2;
+    }
+
+    h2 {
+      margin-top: 2rem;
+      border-bottom: 1px solid GrayText;
+      padding-bottom: 0.25rem;
+    }
+
+    code {
+      font-family: Consolas, "Courier New", monospace;
+    }
+
+    pre {
+      overflow-x: auto;
+      border: 1px solid GrayText;
+      padding: 0.75rem;
+    }
+
+    a {
+      color: LinkText;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Fanfic Downloader</h1>
+    <p>Fanfic Downloader is an accessible Windows downloader and EPUB cleaner for Archive of Our Own, FanFiction.net, and FictionPress. It accepts supported links from the command line or clipboard, retries previously failed stories, and avoids duplicate queue entries when different chapters of the same story are supplied.</p>
+
+    <h2>Installation</h2>
+    <ol>
+      <li>Download the latest <code>FanficDownloader</code> ZIP from <a href="https://github.com/OnjLouis/fanfic-downloader/releases/latest">GitHub Releases</a>.</li>
+      <li>Extract the complete archive to a folder you can write to.</li>
+      <li>Run <code>Install Fanfic Downloader.cmd</code> once.</li>
+      <li>Run <code>Download AO3 with FanFicFare.cmd</code> whenever a supported URL is in the clipboard.</li>
+    </ol>
+    <p>Python 3.10 or later is required for the FanFicFare fallback. The installer creates a private environment named <code>fanficfare_env</code> and installs the tested dependency versions without changing the system Python environment.</p>
+
+    <h2>User Data</h2>
+    <p>All installation-specific data lives under <code>user</code>:</p>
+    <ul>
+      <li><code>user\downloader.ini</code> contains downloader settings.</li>
+      <li><code>user\fanficfare_personal.ini</code> contains FanFicFare settings.</li>
+      <li><code>user\logs</code> contains diagnostic logs and the failed URL queue.</li>
+      <li><code>user\downloads</code> is the default output folder.</li>
+      <li><code>user\updates</code> contains update state and the two most recent rollback snapshots.</li>
+    </ul>
+    <p>Updates never replace or package the <code>user</code> folder. Older installations with settings or logs at the program root migrate them automatically. Conflicting files are retained under <code>user\migration-conflicts</code> instead of being overwritten.</p>
+
+    <h2>Updates</h2>
+    <p>The downloader checks GitHub no more than once every 24 hours. When a newer stable release is available, it offers to install it before continuing. <code>Update Fanfic Downloader.cmd</code> performs a manual check.</p>
+    <p>Every update is staged and validated before installation. The updater requires a valid RSA-signed manifest, verifies the package SHA-256 hash, rejects undeclared or unsafe archive entries, backs up managed files, parse-checks PowerShell scripts, and rolls back a partial replacement. An update cannot declare <code>user</code> as a managed path.</p>
+
+    <h2>Configuration</h2>
+    <p>The supplied <code>downloader.example.ini</code> and <code>fanficfare.example.ini</code> files document the initial settings. The installer copies them into <code>user</code> only when the corresponding personal file does not already exist.</p>
+    <p>Update prompts can be disabled without disabling manual updates:</p>
+    <pre><code>[updates]
+check_for_updates=true
+prompt_to_install=false</code></pre>
+
+    <h2>License</h2>
+    <p>Fanfic Downloader is released under the <a href="LICENSE">MIT License</a>. FanFicFare and the supported websites remain subject to their own licences and terms.</p>
+  </main>
+</body>
+</html>
