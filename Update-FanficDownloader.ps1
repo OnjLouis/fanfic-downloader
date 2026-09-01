@@ -13,7 +13,7 @@ $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 $ProductId = "OnjLouis.FanficDownloader"
-$ReleaseApiUrl = "https://api.github.com/repos/OnjLouis/fanfic-downloader/releases/latest"
+$ReleaseApiUrl = "https://api.github.com/repos/OnjLouis/fanfic-downloader/releases?per_page=20"
 $UpdateCheckHours = 24
 $MaximumMetadataBytes = 1MB
 $MaximumPackageBytes = 20MB
@@ -89,6 +89,8 @@ function Get-HttpsBytes {
     $client = [System.Net.Http.HttpClient]::new($handler)
     $client.Timeout = [TimeSpan]::FromSeconds(90)
     $client.DefaultRequestHeaders.UserAgent.ParseAdd("OnjLouis-FanficDownloader-Updater/1.0")
+    $client.DefaultRequestHeaders.CacheControl = [System.Net.Http.Headers.CacheControlHeaderValue]::new()
+    $client.DefaultRequestHeaders.CacheControl.NoCache = $true
     $response = $null
     $stream = $null
     $memory = [System.IO.MemoryStream]::new()
@@ -139,12 +141,37 @@ function Get-ReleaseAsset {
 }
 
 function Get-LatestRelease {
-    $releaseBytes = Get-HttpsBytes -Url $ReleaseApiUrl -MaximumBytes $MaximumMetadataBytes
-    $release = [System.Text.Encoding]::UTF8.GetString($releaseBytes) | ConvertFrom-Json
-    if ([bool]$release.draft -or [bool]$release.prerelease) {
-        throw "GitHub returned an unfinished release."
+    $requestUrl = $ReleaseApiUrl + "&cachebust=" + [DateTime]::UtcNow.Ticks
+    $releaseBytes = Get-HttpsBytes -Url $requestUrl -MaximumBytes $MaximumMetadataBytes
+    $parsedReleases = [System.Text.Encoding]::UTF8.GetString($releaseBytes) | ConvertFrom-Json
+    $releases = New-Object System.Collections.Generic.List[object]
+    if ($parsedReleases -is [System.Array]) {
+        foreach ($parsedRelease in $parsedReleases) {
+            $releases.Add($parsedRelease)
+        }
     }
-    $version = Convert-ToVersion ([string]$release.tag_name)
+    else {
+        $releases.Add($parsedReleases)
+    }
+    $candidates = @()
+    foreach ($candidate in $releases) {
+        if ([bool]$candidate.draft -or [bool]$candidate.prerelease) {
+            continue
+        }
+        try {
+            $candidateVersion = Convert-ToVersion ([string]$candidate.tag_name)
+            $candidates += [pscustomobject]@{ Version = $candidateVersion; Release = $candidate }
+        }
+        catch {
+            continue
+        }
+    }
+    if ($candidates.Count -eq 0) {
+        throw "GitHub returned no stable Fanfic Downloader release."
+    }
+    $selected = $candidates | Sort-Object Version -Descending | Select-Object -First 1
+    $version = $selected.Version
+    $release = $selected.Release
     $versionText = $version.ToString(3)
     $packageName = "FanficDownloader-$versionText.zip"
     $manifestName = "FanficDownloader-$versionText.manifest.json"
@@ -347,11 +374,18 @@ function Expand-VerifiedPackage {
 }
 
 function Remove-OldUpdateData {
+    foreach ($directory in @(Get-ChildItem -LiteralPath $UpdateDirectory -Directory -Filter "download-*" -ErrorAction SilentlyContinue)) {
+        $null = Remove-UpdateDirectory -Path $directory.FullName
+    }
+    $stagingParent = Join-Path $UpdateDirectory "staging"
+    foreach ($directory in @(Get-ChildItem -LiteralPath $stagingParent -Directory -ErrorAction SilentlyContinue)) {
+        $null = Remove-UpdateDirectory -Path $directory.FullName
+    }
     $backupRoot = Join-Path $UpdateDirectory "backups"
     if (Test-Path -LiteralPath $backupRoot) {
         $oldBackups = @(Get-ChildItem -LiteralPath $backupRoot -Directory | Sort-Object LastWriteTime -Descending | Select-Object -Skip $RetainedBackups)
         foreach ($backup in $oldBackups) {
-            [System.IO.Directory]::Delete($backup.FullName, $true)
+            $null = Remove-UpdateDirectory -Path $backup.FullName
         }
     }
     if (Test-Path -LiteralPath $UpdateLogDirectory) {
@@ -360,6 +394,33 @@ function Remove-OldUpdateData {
             Remove-Item -LiteralPath $log.FullName -Force
         }
     }
+}
+
+function Remove-UpdateDirectory {
+    param(
+        [string] $Path,
+        [int] $Attempts = 6
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return $true
+    }
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        try {
+            Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+            if (-not (Test-Path -LiteralPath $Path)) {
+                return $true
+            }
+        }
+        catch {
+            if ($attempt -eq $Attempts) {
+                Write-UpdateStatus "Temporary update data could not yet be removed: $Path"
+                return $false
+            }
+        }
+        Start-Sleep -Milliseconds (150 * $attempt)
+    }
+    return -not (Test-Path -LiteralPath $Path)
 }
 
 function Install-VerifiedUpdate {
@@ -434,9 +495,7 @@ function Install-VerifiedUpdate {
         throw
     }
     finally {
-        if (Test-Path -LiteralPath $stagingRoot) {
-            [System.IO.Directory]::Delete($stagingRoot, $true)
-        }
+        $null = Remove-UpdateDirectory -Path $stagingRoot
     }
 }
 
@@ -460,9 +519,7 @@ function Invoke-ReleaseInstall {
         Write-UpdateStatus "Fanfic Downloader $($Release.VersionText) was installed successfully." -Always
     }
     finally {
-        if (Test-Path -LiteralPath $downloadDirectory) {
-            [System.IO.Directory]::Delete($downloadDirectory, $true)
-        }
+        $null = Remove-UpdateDirectory -Path $downloadDirectory
     }
 }
 
