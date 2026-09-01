@@ -1,0 +1,7 @@
+user/
+fanficfare_env/
+release-stage/
+*.zip
+*.7z
+*.manifest.sig
+*.manifest.json
