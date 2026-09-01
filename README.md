@@ -17,11 +17,14 @@ All installation-specific data lives under `user`:
 
 - `user\downloader.ini` contains downloader settings.
 - `user\fanficfare_personal.ini` contains FanFicFare settings.
-- `user\logs` contains diagnostic logs and the failed URL queue.
+- `user\failed-urls.txt` contains the persistent retry queue.
+- `user\logs` contains only the current and immediately previous downloader diagnostics.
 - `user\downloads` is the default output folder.
-- `user\updates` contains update state and the two most recent rollback snapshots.
+- `user\updates` contains update state, one rollback snapshot, and the two most recent updater logs.
 
 Updates never replace or package the `user` folder. Older installations with settings or logs at the program root migrate them automatically. Conflicting files are retained under `user\migration-conflicts` instead of being overwritten.
+
+The retry queue is kept outside `user\logs`, so the entire logs folder can be deleted without losing queued story URLs. Old per-run logs and abandoned temporary queue files are removed automatically.
 
 ## Updates
 

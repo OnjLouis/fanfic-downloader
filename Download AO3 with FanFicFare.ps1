@@ -107,6 +107,104 @@ function Get-ConfigFileText {
     return $Default
 }
 
+function Remove-FileWithRetry {
+    param(
+        [string] $Path,
+        [int] $Attempts = 6
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return $true
+    }
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        try {
+            Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+            if (-not (Test-Path -LiteralPath $Path)) {
+                return $true
+            }
+        }
+        catch {
+            if ($attempt -eq $Attempts) {
+                return $false
+            }
+        }
+        Start-Sleep -Milliseconds (100 * $attempt)
+    }
+    return -not (Test-Path -LiteralPath $Path)
+}
+
+function Remove-AbandonedQueueArtifacts {
+    param(
+        [string] $Directory,
+        [datetime] $OlderThan = ([DateTime]::UtcNow.AddMinutes(-15))
+    )
+
+    if (-not (Test-Path -LiteralPath $Directory -PathType Container)) {
+        return
+    }
+    foreach ($file in @(Get-ChildItem -LiteralPath $Directory -File -Force -ErrorAction SilentlyContinue | Where-Object {
+        $_.Name -match '^\.failed-urls-.*\.(?:tmp|backup)$' -and $_.LastWriteTimeUtc -lt $OlderThan
+    })) {
+        $null = Remove-FileWithRetry -Path $file.FullName
+    }
+}
+
+function Initialize-DownloaderLog {
+    param([string] $LogDirectory)
+
+    New-Item -ItemType Directory -Force -Path $LogDirectory | Out-Null
+    $currentLog = Join-Path $LogDirectory "downloader.log"
+    $previousLog = Join-Path $LogDirectory "downloader-previous.log"
+    if (Remove-FileWithRetry -Path $previousLog) {
+        if (Test-Path -LiteralPath $currentLog -PathType Leaf) {
+            try {
+                Move-Item -LiteralPath $currentLog -Destination $previousLog -Force -ErrorAction Stop
+            }
+            catch {
+                $null = Remove-FileWithRetry -Path $currentLog
+            }
+        }
+    }
+    foreach ($legacyLog in @(Get-ChildItem -LiteralPath $LogDirectory -File -Filter "download-*.log" -ErrorAction SilentlyContinue)) {
+        $null = Remove-FileWithRetry -Path $legacyLog.FullName
+    }
+    Remove-AbandonedQueueArtifacts -Directory $LogDirectory
+    return $currentLog
+}
+
+function Move-LegacyFailedUrlQueue {
+    param(
+        [string] $SourcePath,
+        [string] $DestinationPath
+    )
+
+    if (-not (Test-Path -LiteralPath $SourcePath -PathType Leaf)) {
+        return
+    }
+    $destinationDirectory = Split-Path -Parent $DestinationPath
+    New-Item -ItemType Directory -Force -Path $destinationDirectory | Out-Null
+    $lines = New-Object System.Collections.Generic.List[string]
+    $seen = @{}
+    foreach ($path in @($DestinationPath, $SourcePath)) {
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            continue
+        }
+        foreach ($line in Get-Content -LiteralPath $path -ErrorAction SilentlyContinue) {
+            $trimmed = $line.Trim()
+            if ([string]::IsNullOrWhiteSpace($trimmed)) {
+                continue
+            }
+            $key = $trimmed.ToLowerInvariant()
+            if (-not $seen.ContainsKey($key)) {
+                $seen[$key] = $true
+                $lines.Add($trimmed)
+            }
+        }
+    }
+    [System.IO.File]::WriteAllLines($DestinationPath, [string[]]$lines, [System.Text.Encoding]::ASCII)
+    $null = Remove-FileWithRetry -Path $SourcePath
+}
+
 function Test-FilesEquivalent {
     param(
         [string] $FirstPath,
@@ -271,17 +369,19 @@ $pageCss = Get-ConfigFileText -Path $pageCssPath -Default $defaultPageCss
 New-Item -ItemType Directory -Force -Path $logDir, $outDir | Out-Null
 
 $stamp = Get-Date -Format "yyyy-MM-dd_HHmmss"
-$logFile = Join-Path $logDir "download-$stamp.log"
+$logFile = Initialize-DownloaderLog -LogDirectory $logDir
 $started = Get-Date
 $stageDir = Join-Path $env:TEMP "ao3-downloader-$stamp-$PID"
 New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
 $failedUrlSetting = Get-ConfigValue -Config $settings -Section "paths" -Key "failed_url_file" -Default ""
 if ([string]::IsNullOrWhiteSpace($failedUrlSetting)) {
-    $failedUrlFile = Join-Path $logDir "failed-urls.txt"
+    $failedUrlFile = Join-Path $userDir "failed-urls.txt"
+    Move-LegacyFailedUrlQueue -SourcePath (Join-Path $logDir "failed-urls.txt") -DestinationPath $failedUrlFile
 }
 else {
     $failedUrlFile = Resolve-ConfigPath -Value $failedUrlSetting -BaseDir $userDir
 }
+Remove-AbandonedQueueArtifacts -Directory (Split-Path -Parent $failedUrlFile)
 $failedUrls = @()
 $hadErrors = $false
 
@@ -408,8 +508,8 @@ function Set-FailedUrlQueue {
         }
     }
     finally {
-        Remove-Item -LiteralPath $temporaryQueue -Force -ErrorAction SilentlyContinue
-        Remove-Item -LiteralPath $backupQueue -Force -ErrorAction SilentlyContinue
+        $null = Remove-FileWithRetry -Path $temporaryQueue
+        $null = Remove-FileWithRetry -Path $backupQueue
     }
 }
 

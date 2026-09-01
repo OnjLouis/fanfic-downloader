@@ -19,8 +19,8 @@ $MaximumMetadataBytes = 1MB
 $MaximumPackageBytes = 20MB
 $MaximumExtractedBytes = 30MB
 $MaximumArchiveEntries = 100
-$RetainedBackups = 2
-$RetainedLogs = 10
+$RetainedBackups = 1
+$RetainedLogs = 2
 $TrustedPublicKeyXml = @'
 <RSAKeyValue><Modulus>ksgLIbZif39/IxO5HhD4ZtESlhHHAkEzo5B/sfoa0fk74waCbCqwAXP0d2z3LJ7oe+qg9Nd+HH0m2RHS50berb8FcST/CqC+RMmnOxgkP7TOWeuK9DPpjjRj8Y+yfsDGfeepW+l531fgIK5JhinH7q/fFDt4H/w2Ag7afsOkQxC44CmP9/n5ecAWbvBmy+iGid3BX+V5T44yBsUDJB0QipemQ39StwQU/8edActbkuVdf3R4EF8Qz0fb6snXZSx3XHuVqz9W/TKu6YmwVohx7b73S1ZL74MyRxFCBUEDXFpKRmUu8H+E1fwGagwyl5t7MJ/vc0ICEhWUb+OQcruf5lD0IO1VonC8//F3Wn9XZdmN8t7SPxyyLlOxijvQ8aQVWLL8K/9S+0/3jYEA34H1RKYcT1cM+2UbODOHlIAW2ZRrEUIBefBsvkV9ubM86tKYNv7iUwYL9w7idO/ZmkrIbc0FcjSGV65jYFCvKMMDbuQUQrOp9wluBPW8dM8Daeu1</Modulus><Exponent>AQAB</Exponent></RSAKeyValue>
 '@
@@ -384,6 +384,9 @@ function Remove-OldUpdateData {
     $stagingParent = Join-Path $UpdateDirectory "staging"
     foreach ($directory in @(Get-ChildItem -LiteralPath $stagingParent -Directory -ErrorAction SilentlyContinue)) {
         $null = Remove-UpdateDirectory -Path $directory.FullName
+    }
+    if ((Test-Path -LiteralPath $stagingParent -PathType Container) -and @(Get-ChildItem -LiteralPath $stagingParent -Force -ErrorAction SilentlyContinue).Count -eq 0) {
+        $null = Remove-UpdateDirectory -Path $stagingParent
     }
     $backupRoot = Join-Path $UpdateDirectory "backups"
     if (Test-Path -LiteralPath $backupRoot) {

@@ -68,11 +68,13 @@
     <ul>
       <li><code>user\downloader.ini</code> contains downloader settings.</li>
       <li><code>user\fanficfare_personal.ini</code> contains FanFicFare settings.</li>
-      <li><code>user\logs</code> contains diagnostic logs and the failed URL queue.</li>
+      <li><code>user\failed-urls.txt</code> contains the persistent retry queue.</li>
+      <li><code>user\logs</code> contains only the current and immediately previous downloader diagnostics.</li>
       <li><code>user\downloads</code> is the default output folder.</li>
-      <li><code>user\updates</code> contains update state and the two most recent rollback snapshots.</li>
+      <li><code>user\updates</code> contains update state, one rollback snapshot, and the two most recent updater logs.</li>
     </ul>
     <p>Updates never replace or package the <code>user</code> folder. Older installations with settings or logs at the program root migrate them automatically. Conflicting files are retained under <code>user\migration-conflicts</code> instead of being overwritten.</p>
+    <p>The retry queue is kept outside <code>user\logs</code>, so the entire logs folder can be deleted without losing queued story URLs. Old per-run logs and abandoned temporary queue files are removed automatically.</p>
 
     <h2>Updates</h2>
     <p>The downloader checks GitHub no more than once every 24 hours. When a newer stable release is available, it offers to install it before continuing. <code>Update Fanfic Downloader.cmd</code> performs a manual check.</p>
