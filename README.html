@@ -54,6 +54,14 @@
     <h1>Fanfic Downloader</h1>
     <p>Fanfic Downloader is an accessible Windows downloader and EPUB cleaner for Archive of Our Own, FanFiction.net, and FictionPress. It accepts supported links from the command line or clipboard, retries previously failed stories, and avoids duplicate queue entries when different chapters of the same story are supplied.</p>
 
+    <h2>What's New in 1.0.6</h2>
+    <ul>
+      <li>Fixed post-download EPUB inspection in a clean Windows PowerShell session by loading ZIP support before reading the archive.</li>
+      <li>EPUB preparation now repairs harmless whitespace before XML declarations and reports malformed XML without dumping chapter text into the terminal.</li>
+      <li>The terminal shows story names where possible, or a short AO3 work or series label, while complete URLs and diagnostic details remain in the log.</li>
+      <li>Temporary preparation folders are removed after success, failure, and timeout, and diagnostic-only startup no longer creates one.</li>
+    </ul>
+
     <h2>Installation</h2>
     <ol>
       <li>Download the latest <code>FanficDownloader</code> ZIP from <a href="https://github.com/OnjLouis/fanfic-downloader/releases/latest">GitHub Releases</a>.</li>
@@ -75,6 +83,7 @@
     </ul>
     <p>Updates never replace or package the <code>user</code> folder. Older installations with settings or logs at the program root migrate them automatically. Conflicting files are retained under <code>user\migration-conflicts</code> instead of being overwritten.</p>
     <p>The retry queue is kept outside <code>user\logs</code>, so the entire logs folder can be deleted without losing queued story URLs. Old per-run logs and abandoned temporary queue files are removed automatically.</p>
+    <p>The terminal uses story names where the source URL provides one and short AO3 work or series labels otherwise. Full URLs and detailed subprocess errors remain in the diagnostic log, while fatal terminal output is limited to a concise summary and the log location.</p>
 
     <h2>Updates</h2>
     <p>The downloader checks GitHub no more than once every 24 hours. When a newer stable release is available, it offers to install it before continuing. <code>Update Fanfic Downloader.cmd</code> performs a manual check.</p>

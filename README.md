@@ -2,6 +2,13 @@
 
 Fanfic Downloader is an accessible Windows downloader and EPUB cleaner for Archive of Our Own, FanFiction.net, and FictionPress. It accepts supported links from the command line or clipboard, retries previously failed stories, and avoids duplicate queue entries when different chapters of the same story are supplied.
 
+## What's New in 1.0.6
+
+- Fixed post-download EPUB inspection in a clean Windows PowerShell session by loading ZIP support before reading the archive.
+- EPUB preparation now repairs harmless whitespace before XML declarations and reports malformed XML without dumping chapter text into the terminal.
+- The terminal shows story names where possible, or a short AO3 work or series label, while complete URLs and diagnostic details remain in the log.
+- Temporary preparation folders are removed after success, failure, and timeout, and diagnostic-only startup no longer creates one.
+
 ## Installation
 
 1. Download the latest `FanficDownloader` ZIP from GitHub Releases.
@@ -25,6 +32,8 @@ All installation-specific data lives under `user`:
 Updates never replace or package the `user` folder. Older installations with settings or logs at the program root migrate them automatically. Conflicting files are retained under `user\migration-conflicts` instead of being overwritten.
 
 The retry queue is kept outside `user\logs`, so the entire logs folder can be deleted without losing queued story URLs. Old per-run logs and abandoned temporary queue files are removed automatically.
+
+The terminal uses story names where the source URL provides one and short AO3 work or series labels otherwise. Full URLs and detailed subprocess errors remain in the diagnostic log, while fatal terminal output is limited to a concise summary and the log location.
 
 ## Updates
 

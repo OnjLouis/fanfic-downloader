@@ -372,7 +372,9 @@ $stamp = Get-Date -Format "yyyy-MM-dd_HHmmss"
 $logFile = Initialize-DownloaderLog -LogDirectory $logDir
 $started = Get-Date
 $stageDir = Join-Path $env:TEMP "ao3-downloader-$stamp-$PID"
-New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
+if (-not $LibraryOnly) {
+    New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
+}
 $failedUrlSetting = Get-ConfigValue -Config $settings -Section "paths" -Key "failed_url_file" -Default ""
 if ([string]::IsNullOrWhiteSpace($failedUrlSetting)) {
     $failedUrlFile = Join-Path $userDir "failed-urls.txt"
@@ -394,6 +396,33 @@ function Write-Status {
     param([string] $Message)
     Write-Host $Message
     Write-Log $Message
+}
+
+function Remove-DownloaderStage {
+    param([string] $Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) {
+        return
+    }
+    try {
+        $resolvedStage = [System.IO.Path]::GetFullPath($Path).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
+        $resolvedTemp = [System.IO.Path]::GetFullPath($env:TEMP).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
+        if ([System.IO.Path]::GetDirectoryName($resolvedStage) -ne $resolvedTemp -or [System.IO.Path]::GetFileName($resolvedStage) -notlike "ao3-downloader-*") {
+            throw "Refusing to remove an unexpected staging path: $resolvedStage"
+        }
+        [System.IO.Directory]::Delete($resolvedStage, $true)
+    }
+    catch {
+        Write-Log "Could not remove temporary staging directory `"$Path`": $($_.Exception.Message)"
+    }
+}
+
+function Remove-DownloaderStagesForProcessId {
+    param([int] $ProcessId)
+
+    foreach ($directory in @(Get-ChildItem -LiteralPath $env:TEMP -Directory -Filter "ao3-downloader-*-$ProcessId" -Force -ErrorAction SilentlyContinue)) {
+        Remove-DownloaderStage -Path $directory.FullName
+    }
 }
 
 function Invoke-StartupUpdateCheck {
@@ -453,11 +482,12 @@ function Close-WithError {
     )
 
     if ($Message) {
+        Write-Host $Message
         Write-Log $Message
     }
     Write-Log ""
     Write-Log "Log saved to: `"$logFile`""
-    Get-Content -LiteralPath $logFile
+    Write-Host "Log saved to: `"$logFile`""
     if ($pauseOnError) {
         Write-Host ""
         Read-Host "Press Enter to close"
@@ -467,7 +497,7 @@ function Close-WithError {
             Remove-Item -LiteralPath $temporaryConfig -Force -ErrorAction SilentlyContinue
         }
     }
-    Remove-Item -LiteralPath $stageDir -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-DownloaderStage -Path $stageDir
     exit $Code
 }
 
@@ -648,6 +678,57 @@ function Replace-ZipEntryText {
     }
 }
 
+function ConvertTo-EpubXmlDocument {
+    param(
+        [string] $Content,
+        [string] $EntryName
+    )
+
+    $document = New-Object System.Xml.XmlDocument
+    $document.PreserveWhitespace = $true
+    try {
+        $document.LoadXml($Content)
+    }
+    catch {
+        $message = $_.Exception.Message
+        if ($_.Exception.InnerException) {
+            $message = $_.Exception.InnerException.Message
+        }
+        throw "EPUB XML is invalid in ${EntryName}: $message"
+    }
+    return $document
+}
+
+function Repair-EpubXmlDeclarationWhitespace {
+    param([string] $EpubPath)
+
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+    $changedCount = 0
+    $zip = Open-EpubForUpdate -EpubPath $EpubPath
+    try {
+        $xmlEntries = @($zip.Entries | Where-Object {
+            $_.FullName -match '\.(opf|ncx|xhtml|xml)$' -and $_.Length -gt 0
+        })
+        foreach ($entry in $xmlEntries) {
+            $content = Read-ZipEntryText -Entry $entry
+            $updated = [regex]::Replace($content, '^\s+(?=<\?xml(?:\s|\?>))', '')
+            if ($updated -eq $content) {
+                continue
+            }
+            Replace-ZipEntryText -Zip $zip -Entry $entry -Content $updated
+            $changedCount++
+        }
+    }
+    finally {
+        if ($zip) {
+            $zip.Dispose()
+        }
+    }
+    return $changedCount
+}
+
 function Open-EpubForUpdate {
     param([string] $EpubPath)
 
@@ -716,7 +797,7 @@ function Test-EpubIntegrity {
         if (-not $containerEntry) {
             throw "EPUB has no META-INF/container.xml entry."
         }
-        $containerXml = [xml](Read-ZipEntryText -Entry $containerEntry)
+        $containerXml = ConvertTo-EpubXmlDocument -Content (Read-ZipEntryText -Entry $containerEntry) -EntryName $containerEntry.FullName
         $rootfileNode = $containerXml.SelectSingleNode("//*[local-name()='rootfile']")
         if (-not $rootfileNode -or [string]::IsNullOrWhiteSpace($rootfileNode.GetAttribute("full-path"))) {
             throw "EPUB container does not identify a package document."
@@ -727,7 +808,7 @@ function Test-EpubIntegrity {
         if (-not $opfEntry) {
             throw "EPUB package document is missing: $opfPath"
         }
-        $opfXml = [xml](Read-ZipEntryText -Entry $opfEntry)
+        $opfXml = ConvertTo-EpubXmlDocument -Content (Read-ZipEntryText -Entry $opfEntry) -EntryName $opfEntry.FullName
 
         $manifestIds = @{}
         foreach ($item in @($opfXml.SelectNodes("//*[local-name()='manifest']/*[local-name()='item']"))) {
@@ -758,16 +839,11 @@ function Test-EpubIntegrity {
         foreach ($xmlEntry in @($entries | Where-Object {
             $_.FullName -match '\.(opf|ncx|xhtml)$' -or $_.FullName -eq "META-INF/container.xml"
         })) {
-            try {
-                $null = [xml](Read-ZipEntryText -Entry $xmlEntry)
-            }
-            catch {
-                throw "EPUB XML is invalid in $($xmlEntry.FullName): $($_.Exception.Message)"
-            }
+            $null = ConvertTo-EpubXmlDocument -Content (Read-ZipEntryText -Entry $xmlEntry) -EntryName $xmlEntry.FullName
         }
 
         foreach ($navEntry in @($entries | Where-Object { $_.FullName -match '(^|/)nav\.xhtml$' })) {
-            $navXml = [xml](Read-ZipEntryText -Entry $navEntry)
+            $navXml = ConvertTo-EpubXmlDocument -Content (Read-ZipEntryText -Entry $navEntry) -EntryName $navEntry.FullName
             foreach ($anchor in @($navXml.SelectNodes("//*[local-name()='a']"))) {
                 $href = $anchor.GetAttribute("href")
                 if ([string]::IsNullOrWhiteSpace($href) -or $href.StartsWith("#") -or $href -match '^[a-z][a-z0-9+.-]*:') {
@@ -781,7 +857,7 @@ function Test-EpubIntegrity {
         }
 
         foreach ($ncxEntry in @($entries | Where-Object { $_.FullName -match '\.ncx$' })) {
-            $ncxXml = [xml](Read-ZipEntryText -Entry $ncxEntry)
+            $ncxXml = ConvertTo-EpubXmlDocument -Content (Read-ZipEntryText -Entry $ncxEntry) -EntryName $ncxEntry.FullName
             foreach ($contentNode in @($ncxXml.SelectNodes("//*[local-name()='content']"))) {
                 $src = $contentNode.GetAttribute("src")
                 if ([string]::IsNullOrWhiteSpace($src) -or $src -match '^[a-z][a-z0-9+.-]*:') {
@@ -1578,7 +1654,7 @@ function Get-EpubChapterCount {
             return 0
         }
 
-        $opfXml = [xml](Read-ZipEntryText -Entry $opfEntry)
+        $opfXml = ConvertTo-EpubXmlDocument -Content (Read-ZipEntryText -Entry $opfEntry) -EntryName $opfEntry.FullName
         $manifest = @{}
         foreach ($item in @($opfXml.SelectNodes("//*[local-name()='manifest']/*[local-name()='item']"))) {
             $manifest[$item.GetAttribute("id")] = [System.Uri]::UnescapeDataString($item.GetAttribute("href"))
@@ -2053,6 +2129,27 @@ function Convert-ToDownloadUrl {
     return $Value
 }
 
+function Get-StoryDisplayName {
+    param([string] $Value)
+
+    $normalizedUrl = Convert-ToDownloadUrl $Value
+    if ($normalizedUrl -match '^https?://(?:www\.)?(?:fanfiction\.net|fictionpress\.com)/s/\d+(?:/\d+)?/(?<slug>[^/?#]+)') {
+        $name = [System.Uri]::UnescapeDataString($Matches['slug']) -replace '-', ' '
+        if (-not [string]::IsNullOrWhiteSpace($name)) {
+            return $name.Trim()
+        }
+    }
+    if ($normalizedUrl -match '^https?://archiveofourown\.org/(?<kind>works|series)/(?<id>\d+)') {
+        $kind = if ($Matches['kind'] -eq 'series') { 'series' } else { 'work' }
+        return "AO3 $kind $($Matches['id'])"
+    }
+    if ($normalizedUrl -match '^https?://(?:www\.)?(?<site>fanfiction\.net|fictionpress\.com)/s/(?<id>\d+)') {
+        $siteName = if ($Matches['site'] -eq 'fictionpress.com') { 'FictionPress story' } else { 'FanFiction.net story' }
+        return "$siteName $($Matches['id'])"
+    }
+    return 'Story'
+}
+
 function Get-DownloadStoryKey {
     param([string] $Value)
 
@@ -2276,6 +2373,7 @@ function Invoke-EpubPreparationSteps {
         return $result
     }
 
+    $null = & $runStep "Normalizing XML declarations" { Repair-EpubXmlDeclarationWhitespace -EpubPath $EpubPath }
     if ($removeAfterword) {
         $null = & $runStep "Removing AO3 afterword" { Remove-Ao3AfterwordFromEpub -EpubPath $EpubPath }
     }
@@ -2344,6 +2442,8 @@ function Invoke-EpubPreparationWorker {
     }
 
     if ($timedOut) {
+        $null = $process.WaitForExit(5000)
+        Remove-DownloaderStagesForProcessId -ProcessId $process.Id
         Remove-Item -LiteralPath $resultPath -ErrorAction SilentlyContinue
         return [pscustomobject]@{
             Success = $false
@@ -2434,6 +2534,9 @@ function Get-EpubSourceUrl {
         return $null
     }
 
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+
     $candidateByKey = @{}
     foreach ($candidate in $CandidateUrls) {
         if ($candidate -match 'archiveofourown\.org/works/(\d+)') {
@@ -2498,7 +2601,7 @@ if ($PrepareOnly) {
         [System.IO.File]::WriteAllText($PrepareResult, $json, [System.Text.UTF8Encoding]::new($false))
     }
     finally {
-        Remove-Item -LiteralPath $stageDir -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-DownloaderStage -Path $stageDir
     }
     exit $workerExitCode
 }
@@ -2514,7 +2617,7 @@ Write-Status "Output folder: `"$outDir`""
 if (Invoke-StartupUpdateCheck) {
     Write-Status "Update installed; restarting the requested download."
     if ($stageDir -and (Test-Path -LiteralPath $stageDir)) {
-        Remove-Item -LiteralPath $stageDir -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-DownloaderStage -Path $stageDir
     }
     $restartArguments = @(
         "-NoProfile",
@@ -2614,7 +2717,9 @@ if ($urls.Count -eq 0) {
 
 Write-Status "Preparing to download $($urls.Count) fic(s)."
 for ($urlIndex = 0; $urlIndex -lt $urls.Count; $urlIndex++) {
-    Write-Status "URL $($urlIndex + 1) of $($urls.Count): $($urls[$urlIndex])"
+    $storyNumber = $urlIndex + 1
+    Write-Host "Story $storyNumber of $($urls.Count): $(Get-StoryDisplayName $urls[$urlIndex])"
+    Write-Log "URL $storyNumber of $($urls.Count): $($urls[$urlIndex])"
 }
 
 Write-Log ""
@@ -2992,7 +3097,7 @@ if ($fics.Count -gt 0) {
             Write-Status "Retry failed URLs from: `"$failedUrlFile`""
         }
     }
-    Remove-Item -LiteralPath $stageDir -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-DownloaderStage -Path $stageDir
     if ($hadErrors -and $pauseOnError) {
         Write-Host ""
         Read-Host "Press Enter to close"
