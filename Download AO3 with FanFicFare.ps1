@@ -321,6 +321,8 @@ $readClipboard = Get-ConfigBool -Config $settings -Section "download" -Key "read
 $autoStartClipboard = Get-ConfigBool -Config $settings -Section "download" -Key "auto_start_clipboard" -Default $true
 $preferNative = Get-ConfigBool -Config $settings -Section "download" -Key "prefer_native" -Default $true
 $useFichub = Get-ConfigBool -Config $settings -Section "download" -Key "use_fichub" -Default $true
+$useFichubForAo3 = Get-ConfigBool -Config $settings -Section "download" -Key "use_fichub_for_ao3" -Default $true
+$allowUnverifiedAo3Cache = Get-ConfigBool -Config $settings -Section "download" -Key "allow_unverified_ao3_cache" -Default $false
 $fallbackHtmlToEpub = Get-ConfigBool -Config $settings -Section "download" -Key "fallback_html_to_epub" -Default $true
 $retryFailedUrls = Get-ConfigBool -Config $settings -Section "download" -Key "retry_failed_urls" -Default $true
 $nativeTimeoutSeconds = [int](Get-ConfigValue -Config $settings -Section "download" -Key "native_timeout_seconds" -Default "90")
@@ -386,6 +388,7 @@ else {
 Remove-AbandonedQueueArtifacts -Directory (Split-Path -Parent $failedUrlFile)
 $failedUrls = @()
 $hadErrors = $false
+$chapterHistoryFile = Join-Path $userDir "chapter-history.json"
 
 function Write-Log {
     param([string] $Message)
@@ -396,6 +399,93 @@ function Write-Status {
     param([string] $Message)
     Write-Host $Message
     Write-Log $Message
+}
+
+function Read-Ao3ChapterHistory {
+    param([string] $Path)
+
+    $history = @{}
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return $history
+    }
+
+    $data = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json -ErrorAction Stop
+    if ($null -eq $data -or $data -isnot [pscustomobject]) {
+        throw "AO3 chapter history is not a JSON object."
+    }
+    foreach ($property in $data.PSObject.Properties) {
+        $count = 0
+        if ($property.Name -notmatch '^ao3:\d+$' -or
+            -not [int]::TryParse([string]$property.Value, [ref]$count) -or $count -lt 1) {
+            throw "AO3 chapter history contains an invalid work ID or chapter count."
+        }
+        $history[$property.Name] = $count
+    }
+    return $history
+}
+
+function Save-Ao3ChapterHistory {
+    param([string] $Path, [hashtable] $History)
+
+    $orderedHistory = [ordered]@{}
+    foreach ($key in @($History.Keys | Sort-Object)) {
+        if ($key -notmatch '^ao3:\d+$' -or [int]$History[$key] -lt 1) {
+            throw "Refusing to save an invalid AO3 chapter history entry."
+        }
+        $orderedHistory[$key] = [int]$History[$key]
+    }
+
+    $directory = Split-Path -Parent $Path
+    $temporary = Join-Path $directory (".chapter-history-" + [guid]::NewGuid().ToString("N") + ".tmp")
+    $backup = "$Path.backup-" + [guid]::NewGuid().ToString("N")
+    try {
+        $json = ConvertTo-Json -InputObject $orderedHistory -Depth 3
+        [System.IO.File]::WriteAllText($temporary, $json, [System.Text.UTF8Encoding]::new($false))
+        if (Test-Path -LiteralPath $Path) {
+            [System.IO.File]::Replace($temporary, $Path, $backup, $true)
+        }
+        else {
+            [System.IO.File]::Move($temporary, $Path)
+        }
+    }
+    finally {
+        Remove-Item -LiteralPath $temporary, $backup -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-KnownAo3ChapterCount {
+    param([string] $StoryUrl)
+
+    if ($StoryUrl -notmatch '^https?://archiveofourown\.org/works/(?<id>\d+)(?:[/?#]|$)') {
+        return 0
+    }
+    $key = "ao3:$($Matches['id'])"
+    if ($chapterHistory.ContainsKey($key)) {
+        return [int]$chapterHistory[$key]
+    }
+    return 0
+}
+
+function Record-Ao3ChapterCount {
+    param([string] $StoryUrl, [int] $ChapterCount)
+
+    if ($StoryUrl -notmatch '^https?://archiveofourown\.org/works/(?<id>\d+)(?:[/?#]|$)' -or $ChapterCount -lt 1) {
+        return
+    }
+    $key = "ao3:$($Matches['id'])"
+    if ($chapterHistory.ContainsKey($key) -and [int]$chapterHistory[$key] -ge $ChapterCount) {
+        return
+    }
+    if ($chapterHistoryReadOnly) {
+        throw "AO3 chapter history could not be read and was not replaced."
+    }
+    $updated = @{}
+    foreach ($existingKey in $chapterHistory.Keys) {
+        $updated[$existingKey] = [int]$chapterHistory[$existingKey]
+    }
+    $updated[$key] = $ChapterCount
+    Save-Ao3ChapterHistory -Path $chapterHistoryFile -History $updated
+    $chapterHistory[$key] = $ChapterCount
 }
 
 function Remove-DownloaderStage {
@@ -592,6 +682,28 @@ function Get-PotentialSuccessfulEpubs {
     }
 
     return @($fics + $stageFics | Where-Object { $_ } | Sort-Object FullName -Unique)
+}
+
+function Test-FanFicFareLoginFailure {
+    param([string] $Stdout, [string] $Stderr)
+
+    return "$Stdout`n$Stderr" -match 'Login Failed on non-interactive process'
+}
+
+function Get-HttpStatusCode {
+    param([Exception] $ErrorException)
+
+    $current = $ErrorException
+    while ($current) {
+        if ($current -is [System.Net.WebException] -and $current.Response -and $current.Response.StatusCode) {
+            return [int]$current.Response.StatusCode
+        }
+        $current = $current.InnerException
+    }
+    if ($ErrorException.Message -match '\((?<status>[45]\d\d)\)') {
+        return [int]$Matches['status']
+    }
+    return 0
 }
 
 function Convert-StoryUrlToLink {
@@ -1667,7 +1779,8 @@ function Get-EpubChapterCount {
                 continue
             }
             $href = $manifest[$idref]
-            if ($href -match $chapterFileRegex -and $href -notmatch $skipChapterFileRegex) {
+            if (($href -match $chapterFileRegex -or $href -match '(?i)(^|/)file\d+\.(xhtml|html)$') -and
+                $href -notmatch $skipChapterFileRegex) {
                 $chapterCount++
             }
         }
@@ -1697,7 +1810,10 @@ function Test-FichubChapterAvailability {
     param(
         [string] $StoryUrl,
         [int] $AvailableChapters,
-        [string] $ExistingEpubPath = ""
+        [string] $ExistingEpubPath = "",
+        [int] $KnownChapterCount = 0,
+        [switch] $RequireKnownChapters,
+        [switch] $RequireNewChapters
     )
 
     $requestedChapter = 0
@@ -1710,11 +1826,19 @@ function Test-FichubChapterAvailability {
         $existingChapterCount = Get-EpubChapterCount -EpubPath $ExistingEpubPath
     }
 
-    $minimumExpected = [Math]::Max($requestedChapter, $existingChapterCount)
+    $minimumExpected = [Math]::Max($requestedChapter, [Math]::Max($existingChapterCount, $KnownChapterCount))
     $allowed = $AvailableChapters -ge $minimumExpected
     $message = "FicHub reports $AvailableChapters chapter(s)."
-    if (-not $allowed) {
+    if ($RequireKnownChapters -and $minimumExpected -eq 0) {
+        $allowed = $false
+        $message = "No verified AO3 chapter count is known; keeping this cached copy queued instead of opening an unverified book."
+    }
+    elseif (-not $allowed) {
         $message = "FicHub cache is incomplete: it reports $AvailableChapters chapter(s), but at least $minimumExpected are expected."
+    }
+    elseif ($RequireNewChapters -and $minimumExpected -gt 0 -and $AvailableChapters -le $minimumExpected) {
+        $allowed = $false
+        $message = "FicHub has no newer chapter count than the saved EPUB or chapter history ($minimumExpected); keeping the AO3 URL queued for retry."
     }
 
     return [pscustomobject]@{
@@ -1725,6 +1849,14 @@ function Test-FichubChapterAvailability {
         MinimumExpected = $minimumExpected
         Message = $message
     }
+}
+
+function Test-FichubSourceMatch {
+    param([string] $RequestedUrl, [string] $CachedUrl)
+
+    $requested = [regex]::Match($RequestedUrl, '^https?://archiveofourown\.org/works/(?<id>\d+)(?:[/?#]|$)')
+    $cached = [regex]::Match($CachedUrl, '^https?://archiveofourown\.org/works/(?<id>\d+)(?:[/?#]|$)')
+    return $requested.Success -and $cached.Success -and $requested.Groups['id'].Value -eq $cached.Groups['id'].Value
 }
 
 function Download-NativeAo3Epub {
@@ -1856,14 +1988,14 @@ function Download-NativeAo3File {
 }
 
 function Download-FichubFile {
-    param([string] $StoryUrl)
+    param([string] $StoryUrl, [switch] $RequireNewChapters)
 
     if ($downloadFormat -notin @("epub", "html", "mobi", "pdf")) {
         throw "FicHub supports epub, html, mobi, and pdf output, not $downloadFormat."
     }
 
     $apiUrl = "https://fichub.net/api/v0/epub?q=$([System.Uri]::EscapeDataString($StoryUrl))"
-    Write-Status "Trying FicHub download for FanFiction.net/FictionPress URL."
+    Write-Status "Checking FicHub for a cached copy."
     Write-Log "FicHub API URL: $apiUrl"
 
     try {
@@ -1885,6 +2017,11 @@ function Download-FichubFile {
             $message = "unknown FicHub error"
         }
         throw "FicHub could not export this story: $message"
+    }
+
+    $isAo3Work = $StoryUrl -match '^https?://archiveofourown\.org/works/\d+'
+    if ($isAo3Work -and -not (Test-FichubSourceMatch -RequestedUrl $StoryUrl -CachedUrl ([string]$export.meta.source))) {
+        throw "FicHub did not confirm the same AO3 work ID; refusing a possibly different story."
     }
 
     $relativeDownloadUrl = $null
@@ -1918,15 +2055,31 @@ function Download-FichubFile {
     if ($export.meta -and $null -ne $export.meta.chapters) {
         $fichubChapterCount = [int]$export.meta.chapters
     }
+    if ($isAo3Work -and $fichubChapterCount -lt 1) {
+        throw "FicHub did not report a chapter count for this AO3 work; refusing an unverified copy."
+    }
     $existingEpubPath = ""
     if ($downloadFormat -eq "epub" -and -not [string]::IsNullOrWhiteSpace($metadataStoryTitle)) {
         $existingEpubPath = Join-Path $outDir "$(Get-SafeFileName $metadataStoryTitle).epub"
     }
-    $availability = Test-FichubChapterAvailability -StoryUrl $StoryUrl -AvailableChapters $fichubChapterCount -ExistingEpubPath $existingEpubPath
+    if ($isAo3Work -and -not [string]::IsNullOrWhiteSpace($existingEpubPath) -and
+        (Test-Path -LiteralPath $existingEpubPath) -and
+        (Get-EpubSourceUrl -EpubPath $existingEpubPath -CandidateUrls @($StoryUrl)) -ne $StoryUrl) {
+        throw "A different or unidentified story already uses the FicHub output filename; refusing to replace it."
+    }
+    $knownChapterCount = if ($isAo3Work) { Get-KnownAo3ChapterCount -StoryUrl $StoryUrl } else { 0 }
+    $availability = Test-FichubChapterAvailability -StoryUrl $StoryUrl -AvailableChapters $fichubChapterCount -ExistingEpubPath $existingEpubPath -KnownChapterCount $knownChapterCount -RequireKnownChapters:($isAo3Work -and -not $allowUnverifiedAo3Cache) -RequireNewChapters:$RequireNewChapters
     if (-not $availability.Allowed) {
-        Write-Status $availability.Message
-        Write-Status "Skipping this FicHub export so an incomplete book is not saved or opened."
+        $storyLabel = if ($metadataStoryTitle) { "$metadataStoryTitle`: " } else { "" }
+        Write-Status "$storyLabel$($availability.Message)"
+        if ($RequireNewChapters -and $availability.MinimumExpected -gt 0 -and $availability.MinimumExpected -ge $fichubChapterCount) {
+            return $null
+        }
         throw $availability.Message
+    }
+    if ($isAo3Work) {
+        $cacheDate = if ($export.meta.updated) { ([datetime]$export.meta.updated).ToString('yyyy-MM-dd') } else { 'unknown' }
+        Write-Status "FicHub has $metadataStoryTitle ($fichubChapterCount chapters; cache dated $cacheDate). Current AO3 chapter count cannot be verified."
     }
 
     $temporaryFileName = "$(Get-SafeFileName $slug).$downloadFormat"
@@ -1963,6 +2116,10 @@ function Download-FichubFile {
         if ($downloadedChapterCount -lt $requiredChapterCount) {
             Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue
             throw "FicHub EPUB is incomplete: it contains $downloadedChapterCount chapter(s), but $requiredChapterCount are expected."
+        }
+        if ($isAo3Work -and (Get-EpubSourceUrl -EpubPath $tempFile -CandidateUrls @($StoryUrl)) -ne $StoryUrl) {
+            Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue
+            throw "FicHub EPUB does not identify the requested AO3 work; refusing a possibly different story."
         }
     }
     $fileName = "$(Get-SafeFileName $storyTitle).$downloadFormat"
@@ -2051,6 +2208,10 @@ function Invoke-NativeAo3Download {
     }
     catch {
         Write-Log "AO3 native EPUB failed for $WorkUrl`: $($_.Exception.Message)"
+        $httpStatus = Get-HttpStatusCode -ErrorException $_.Exception
+        if ($httpStatus -gt 0) {
+            Write-Status "AO3 native EPUB returned HTTP $httpStatus."
+        }
         if (-not $fallbackHtmlToEpub) {
             Write-Status "AO3 native EPUB was unavailable."
             return $null
@@ -2061,6 +2222,10 @@ function Invoke-NativeAo3Download {
         }
         catch {
             Write-Log "AO3 native HTML fallback failed for $WorkUrl`: $($_.Exception.Message)"
+            $httpStatus = Get-HttpStatusCode -ErrorException $_.Exception
+            if ($httpStatus -gt 0) {
+                Write-Status "AO3 native HTML returned HTTP $httpStatus."
+            }
             Write-Status "AO3 native HTML was unavailable."
             return $null
         }
@@ -2574,6 +2739,16 @@ function Get-EpubSourceUrl {
     return $null
 }
 
+$chapterHistoryReadOnly = $false
+try {
+    $chapterHistory = Read-Ao3ChapterHistory -Path $chapterHistoryFile
+}
+catch {
+    $chapterHistory = @{}
+    $chapterHistoryReadOnly = $true
+    Write-Status "ERROR: AO3 chapter history could not be read. Cached AO3 copies without another verified chapter count will stay queued: $($_.Exception.Message)"
+}
+
 if ($PrepareOnly) {
     $workerResult = $null
     $workerExitCode = 0
@@ -2736,7 +2911,25 @@ if ($preferNative) {
                 $ficUrlByPath[$nativeFic.FullName.ToLowerInvariant()] = $url
             }
             else {
-                $fanficfareUrls += $url
+                if ($useFichub -and $useFichubForAo3 -and $downloadFormat -eq 'epub') {
+                    try {
+                        $cachedFic = Download-FichubFile -StoryUrl $url -RequireNewChapters
+                        if ($cachedFic) {
+                            $fics += $cachedFic
+                            $ficUrlByPath[$cachedFic.FullName.ToLowerInvariant()] = $url
+                            Write-Status "Saved FicHub's cached copy; keeping this AO3 work queued until a direct download verifies the latest chapters."
+                        }
+                        $failedUrls += $url
+                    }
+                    catch {
+                        Write-Log "FicHub AO3 fallback failed for $url`: $($_.Exception.Message)"
+                        Write-Status "FicHub could not provide a verified copy: $($_.Exception.Message)"
+                        $fanficfareUrls += $url
+                    }
+                }
+                else {
+                    $fanficfareUrls += $url
+                }
             }
         }
         else {
@@ -2833,8 +3026,13 @@ if (@($fanficfareUrls).Count -gt 0) {
             $stderr = $result.Stderr
 
             $fanficfareReportedFailure = $stdout -match '(?m)\bFailed:' -or $stderr -match '(?m)\bFailed:'
+            $fanficfareLoginFailed = Test-FanFicFareLoginFailure -Stdout $stdout -Stderr $stderr
             $ao3Server525 = $stdout -match '525 Server Error' -or $stderr -match '525 Server Error'
             if ($result.TimedOut) {
+                break
+            }
+            if ($fanficfareLoginFailed) {
+                Write-Status "AO3 requested login, but FanFicFare could not log in."
                 break
             }
             if ($ao3Server525) {
@@ -2856,7 +3054,8 @@ if (@($fanficfareUrls).Count -gt 0) {
     Write-Log "Log saved to: `"$logFile`""
 
     $fanficfareReportedFailure = $stdout -match '(?m)\bFailed:' -or $stderr -match '(?m)\bFailed:'
-    if ($exitCode -ne 0 -or $fanficfareReportedFailure) {
+    $fanficfareLoginFailed = Test-FanFicFareLoginFailure -Stdout $stdout -Stderr $stderr
+    if ($exitCode -ne 0 -or $fanficfareReportedFailure -or $fanficfareLoginFailed) {
         $failureCode = $exitCode
         if ($failureCode -eq 0) {
             $failureCode = 4
@@ -2868,7 +3067,7 @@ if (@($fanficfareUrls).Count -gt 0) {
         if ($reportedFailedUrls.Count -gt 0) {
             $failedUrls += $reportedFailedUrls
         }
-        elseif ($result.TimedOut -or $exitCode -ne 0) {
+        elseif ($result.TimedOut -or $exitCode -ne 0 -or $fanficfareLoginFailed) {
             $failedUrls += $fanficfareUrls
         }
 
@@ -2951,9 +3150,12 @@ if (@($fanficfareUrls).Count -gt 0) {
             Write-Status "FanFicFare timed out for some URLs. Continuing with successful downloads."
         }
 
-        if ($exitCode -ne 0 -or $fanficfareReportedFailure) {
+        if ($exitCode -ne 0 -or $fanficfareReportedFailure -or $fanficfareLoginFailed) {
             Save-FailedUrls -Urls $failedUrls
             if (@(Get-PotentialSuccessfulEpubs).Count -eq 0) {
+                if ($fanficfareLoginFailed) {
+                    Close-WithError $failureCode "ERROR: AO3 requested login and FanFicFare could not complete it. The work remains queued for retry."
+                }
                 Close-WithError $failureCode "ERROR: Download failed. If AO3 shows a site challenge in Chrome, complete it, reload the story page once, then run this command again."
             }
             Write-Status "Some URLs failed. Continuing with successful downloads."
@@ -2978,6 +3180,7 @@ if ($fics.Count -gt 0) {
     foreach ($fic in $fics) {
         Write-Status "Preparing file: $($fic.Name)"
         $sourceUrl = $null
+        $preparedChapterCount = 0
         try {
             $workPath = $fic.FullName
             $sourceKey = $workPath.ToLowerInvariant()
@@ -3005,6 +3208,13 @@ if ($fics.Count -gt 0) {
                     throw $preparationResult.Message
                 }
                 Write-Log "Prepared and validated `"$($fic.Name)`": $($preparationResult.Message)"
+                if ($sourceUrl -match '^https?://archiveofourown\.org/works/\d+') {
+                    $preparedChapterCount = Get-EpubChapterCount -EpubPath $workPath
+                    $knownChapterCount = Get-KnownAo3ChapterCount -StoryUrl $sourceUrl
+                    if ($preparedChapterCount -lt 1 -or $preparedChapterCount -lt $knownChapterCount) {
+                        throw "AO3 EPUB has $preparedChapterCount chapter(s), but at least $knownChapterCount are known. Refusing to replace the previous complete copy."
+                    }
+                }
             }
 
             $finalPath = Join-Path $outDir $fic.Name
@@ -3012,6 +3222,16 @@ if ($fics.Count -gt 0) {
             $preparedRecords += [pscustomobject]@{
                 File = $publishedFile
                 Url = $sourceUrl
+            }
+            if ($preparedChapterCount -gt 0 -and $sourceUrl -match '^https?://archiveofourown\.org/works/\d+') {
+                try {
+                    Record-Ao3ChapterCount -StoryUrl $sourceUrl -ChapterCount $preparedChapterCount
+                }
+                catch {
+                    $hadErrors = $true
+                    $failedUrls += $sourceUrl
+                    Write-Status "ERROR: File was saved, but AO3 chapter history could not be updated: $($_.Exception.Message)"
+                }
             }
             Write-Status "Saved file: $($fic.Name)"
         }
@@ -3108,5 +3328,8 @@ if ($fics.Count -gt 0) {
     exit 0
 }
 else {
+    if (@($failedUrls).Count -gt 0) {
+        Close-WithError 4 "ERROR: No new $downloadFormat file was saved. $(@($failedUrls).Count) URL(s) remain queued in `"$failedUrlFile`"; see the status above for the reason."
+    }
     Close-WithError 4 "ERROR: Download finished, but no new .$downloadFormat file was found in `"$outDir`"."
 }

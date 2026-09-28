@@ -54,7 +54,15 @@
     <h1>Fanfic Downloader</h1>
     <p>Fanfic Downloader is an accessible Windows downloader and EPUB cleaner for Archive of Our Own, FanFiction.net, and FictionPress. It accepts supported links from the command line or clipboard, retries previously failed stories, and avoids duplicate queue entries when different chapters of the same story are supplied.</p>
 
-    <h2>What's New in 1.0.6</h2>
+    <h2>What's New in 1.0.7</h2>
+    <ul>
+      <li>When AO3 blocks direct EPUB and HTML downloads, an optional FicHub fallback checks both the reported source and EPUB against the requested AO3 work ID. It never substitutes a work based on a similar title.</li>
+      <li>The terminal reports AO3 HTTP errors, the FicHub chapter count, and the cache date. A cached copy remains in the failed-URL queue until AO3 can verify a direct download.</li>
+      <li>The downloader remembers the highest AO3 chapter count in <code>user\chapter-history.json</code>, even after an EPUB leaves the output folder. It skips cached copies with fewer or equal chapters and does not repeatedly reopen an unchanged copy.</li>
+      <li>Cached AO3 copies without a known chapter count stay queued by default. <code>allow_unverified_ao3_cache=true</code> permits these potentially incomplete copies; <code>use_fichub_for_ao3=false</code> disables the fallback entirely.</li>
+    </ul>
+
+    <h2>Earlier Changes in 1.0.6</h2>
     <ul>
       <li>Fixed post-download EPUB inspection in a clean Windows PowerShell session by loading ZIP support before reading the archive.</li>
       <li>EPUB preparation now repairs harmless whitespace before XML declarations and reports malformed XML without dumping chapter text into the terminal.</li>
@@ -77,6 +85,7 @@
       <li><code>user\downloader.ini</code> contains downloader settings.</li>
       <li><code>user\fanficfare_personal.ini</code> contains FanFicFare settings.</li>
       <li><code>user\failed-urls.txt</code> contains the persistent retry queue.</li>
+      <li><code>user\chapter-history.json</code> contains the highest known AO3 chapter count for each work. Keep this file when moving books or cleaning logs.</li>
       <li><code>user\logs</code> contains only the current and immediately previous downloader diagnostics.</li>
       <li><code>user\downloads</code> is the default output folder.</li>
       <li><code>user\updates</code> contains update state, one rollback snapshot, and the two most recent updater logs.</li>
@@ -84,6 +93,7 @@
     <p>Updates never replace or package the <code>user</code> folder. Older installations with settings or logs at the program root migrate them automatically. Conflicting files are retained under <code>user\migration-conflicts</code> instead of being overwritten.</p>
     <p>The retry queue is kept outside <code>user\logs</code>, so the entire logs folder can be deleted without losing queued story URLs. Old per-run logs and abandoned temporary queue files are removed automatically.</p>
     <p>The terminal uses story names where the source URL provides one and short AO3 work or series labels otherwise. Full URLs and detailed subprocess errors remain in the diagnostic log, while fatal terminal output is limited to a concise summary and the log location.</p>
+    <p>FicHub is a cache, not an independent source of AO3 updates. When AO3 denies access, the downloader cannot confirm whether FicHub has the latest chapter or text. The downloader checks cached chapter counts against its persistent history and any EPUB still in the output folder. Existing books outside that folder are not imported automatically, so a fresh or upgraded installation may not have a known count yet. Without a known count, it keeps the URL queued unless <code>allow_unverified_ao3_cache=true</code>; even then, a saved cached copy does not remove the URL from the retry queue. It never substitutes a different work based on a similar title.</p>
 
     <h2>Updates</h2>
     <p>The downloader checks GitHub no more than once every 24 hours. When a newer stable release is available, it offers to install it before continuing. <code>Update Fanfic Downloader.cmd</code> performs a manual check.</p>
