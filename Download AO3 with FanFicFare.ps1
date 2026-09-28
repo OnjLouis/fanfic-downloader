@@ -315,6 +315,7 @@ $config = Resolve-ConfigPath -Value (Get-ConfigValue -Config $settings -Section 
 $outDir = Resolve-ConfigPath -Value (Get-ConfigValue -Config $settings -Section "paths" -Key "output_dir" -Default "downloads") -BaseDir $userDir
 $logDir = Resolve-ConfigPath -Value (Get-ConfigValue -Config $settings -Section "paths" -Key "log_dir" -Default "logs") -BaseDir $userDir
 $readerPath = Resolve-ConfigPath -Value (Get-ConfigValue -Config $settings -Section "paths" -Key "reader_path" -Default "") -BaseDir $userDir
+$browserEpubFolder = Resolve-ConfigPath -Value (Get-ConfigValue -Config $settings -Section "paths" -Key "browser_epub_folder" -Default "") -BaseDir $userDir
 $downloadFormat = (Get-ConfigValue -Config $settings -Section "download" -Key "format" -Default "epub").Trim().ToLowerInvariant()
 $openAfterDownload = Get-ConfigBool -Config $settings -Section "download" -Key "open_after_download" -Default $true
 $readClipboard = Get-ConfigBool -Config $settings -Section "download" -Key "read_clipboard" -Default $true
@@ -2739,6 +2740,79 @@ function Get-EpubSourceUrl {
     return $null
 }
 
+function Get-Ao3BrowserEpubCandidate {
+    param(
+        [string] $WorkUrl,
+        [string] $Folder,
+        [int] $KnownChapterCount,
+        [string] $OutputFolder = ''
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Folder) -or -not (Test-Path -LiteralPath $Folder -PathType Container)) {
+        return $null
+    }
+
+    foreach ($epub in @(Get-ChildItem -LiteralPath $Folder -Filter '*.epub' -File -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending)) {
+        try {
+            if ($WorkUrl -notmatch '^https?://archiveofourown\.org/works/(?<id>\d+)') {
+                return $null
+            }
+            $requestedId = $Matches['id']
+            if ((Get-Ao3EpubOriginWorkId -EpubPath $epub.FullName) -ne $requestedId) {
+                continue
+            }
+            $chapterCount = Get-EpubChapterCount -EpubPath $epub.FullName
+            if ($chapterCount -le $KnownChapterCount) {
+                continue
+            }
+            if (-not [string]::IsNullOrWhiteSpace($OutputFolder)) {
+                $title = Get-EpubTitle -EpubPath $epub.FullName
+                if ([string]::IsNullOrWhiteSpace($title)) {
+                    continue
+                }
+                $existingPath = Join-Path $OutputFolder "$(Get-SafeFileName $title).epub"
+                if (Test-Path -LiteralPath $existingPath) {
+                    if ((Get-Ao3EpubOriginWorkId -EpubPath $existingPath) -ne $requestedId -or
+                        $chapterCount -le (Get-EpubChapterCount -EpubPath $existingPath)) {
+                        continue
+                    }
+                }
+            }
+            return $epub
+        }
+        catch {
+            continue
+        }
+    }
+
+    return $null
+}
+
+function Get-Ao3EpubOriginWorkId {
+    param([string] $EpubPath)
+
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($EpubPath)
+    try {
+        foreach ($entry in @($zip.Entries | Where-Object {
+            $_.FullName -match '\.(xhtml|html)$' -and $_.Length -gt 0
+        })) {
+            $content = Read-ZipEntryText -Entry $entry
+            $origin = [regex]::Match($content, '(?is)Posted\s+originally\s+on\b.{0,500}?Archive\s+of\s+Our\s+Own.{0,500}?\bat\s*<a\b[^>]*\bhref\s*=\s*["'']https://archiveofourown\.org/works/(?<id>\d+)(?:[/?#][^"'']*)?["'']')
+            if ($origin.Success) {
+                return $origin.Groups['id'].Value
+            }
+        }
+    }
+    finally {
+        $zip.Dispose()
+    }
+
+    return $null
+}
+
 $chapterHistoryReadOnly = $false
 try {
     $chapterHistory = Read-Ao3ChapterHistory -Path $chapterHistoryFile
@@ -2901,9 +2975,52 @@ Write-Log ""
 $fics = @()
 $ficUrlByPath = @{}
 $fanficfareUrls = @()
-if ($preferNative) {
-    Write-Status "Trying native download routes first."
+$importedUrls = @{}
+if ($downloadFormat -eq 'epub' -and -not [string]::IsNullOrWhiteSpace($browserEpubFolder)) {
+    Write-Status 'Checking browser-downloaded AO3 EPUBs.'
     foreach ($url in $urls) {
+        if ($url -notmatch '^https?://archiveofourown\.org/works/\d+') {
+            continue
+        }
+        $knownChapterCount = Get-KnownAo3ChapterCount -StoryUrl $url
+        $browserEpub = Get-Ao3BrowserEpubCandidate -WorkUrl $url -Folder $browserEpubFolder -KnownChapterCount $knownChapterCount -OutputFolder $outDir
+        if (-not $browserEpub) {
+            continue
+        }
+        $stagedPath = $null
+        $canCleanStage = $false
+        try {
+            $title = Get-EpubTitle -EpubPath $browserEpub.FullName
+            if ([string]::IsNullOrWhiteSpace($title)) {
+                throw 'Browser EPUB has no title.'
+            }
+            $stagedPath = Join-Path $stageDir "$(Get-SafeFileName $title).epub"
+            if (Test-Path -LiteralPath $stagedPath) {
+                throw "Another staged EPUB already uses the title $title."
+            }
+            $canCleanStage = $true
+            Copy-Item -LiteralPath $browserEpub.FullName -Destination $stagedPath -ErrorAction Stop
+            $importedFic = Get-Item -LiteralPath $stagedPath
+            $fics += $importedFic
+            $ficUrlByPath[$importedFic.FullName.ToLowerInvariant()] = $url
+            $importedUrls[$url] = $true
+            Write-Status "Using browser-downloaded EPUB: $title"
+        }
+        catch {
+            if ($canCleanStage -and -not [string]::IsNullOrWhiteSpace($stagedPath)) {
+                Remove-Item -LiteralPath $stagedPath -Force -ErrorAction SilentlyContinue
+            }
+            Write-Log "Browser EPUB import failed for $url`: $($_.Exception.Message)"
+            Write-Status 'Browser EPUB could not be imported; trying the usual download routes.'
+        }
+    }
+}
+if ($preferNative) {
+    Write-Status 'Trying native download routes for remaining fics.'
+    foreach ($url in $urls) {
+        if ($importedUrls.ContainsKey($url)) {
+            continue
+        }
         if ($url -match '^https?://archiveofourown\.org/works/\d+') {
             $nativeFic = Invoke-NativeAo3Download -WorkUrl $url
             if ($nativeFic) {
@@ -2965,6 +3082,9 @@ if ($preferNative) {
 else {
     Write-Status "Trying FanFicFare first."
     foreach ($url in $urls) {
+        if ($importedUrls.ContainsKey($url)) {
+            continue
+        }
         if (Test-FanFictionUrl $url) {
             if (-not $useFichub) {
                 Write-Status "FicHub is disabled, so FanFiction.net URL cannot be downloaded."
@@ -2995,7 +3115,7 @@ else {
 }
 
 if (@($fics).Count -gt 0) {
-    Write-Status "Native download route succeeded for $(@($fics).Count) fic(s)."
+    Write-Status "Retrieved $(@($fics).Count) fic(s) before the FanFicFare backup."
 }
 
 if (@($fanficfareUrls).Count -gt 0) {
@@ -3295,7 +3415,7 @@ if ($fics.Count -gt 0) {
     Write-Status ""
     Write-Status "Run summary:"
     Write-Status "  URLs received: $($urls.Count)"
-    Write-Status "  Files downloaded: $downloadedCount"
+    Write-Status "  Files retrieved: $downloadedCount"
     Write-Status "  Files prepared and saved: $($preparedRecords.Count)"
     if ($openAfterDownload) {
         Write-Status "  Files opened: $openedCount"

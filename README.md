@@ -2,7 +2,12 @@
 
 Fanfic Downloader is an accessible Windows downloader and EPUB cleaner for Archive of Our Own, FanFiction.net, and FictionPress. It accepts supported links from the command line or clipboard, retries previously failed stories, and avoids duplicate queue entries when different chapters of the same story are supplied.
 
-## What's New in 1.0.7
+## What's New in 1.0.8
+
+- Optional `browser_epub_folder` imports AO3 EPUBs that you downloaded manually in your browser. The downloader matches the work's original AO3 attribution, requires more chapters than its recorded or saved copy, applies the usual cleanup, and removes a successfully imported work from the failed-URL queue. It copies the EPUB; the browser download remains untouched.
+- This does not bypass AO3's HTTP restrictions or make Chrome download a work automatically.
+
+## Earlier Changes in 1.0.7
 
 - When AO3 blocks its direct EPUB and HTML downloads, an optional FicHub fallback checks both the reported source and the EPUB against the requested AO3 work ID. It never substitutes a work based on a similar title.
 - The terminal reports AO3 HTTP errors, the FicHub chapter count, and the cache date. A cached copy remains in the failed-URL queue until AO3 can verify a direct download.
@@ -43,7 +48,7 @@ The retry queue is kept outside `user\logs`, so the entire logs folder can be de
 
 The terminal uses story names where the source URL provides one and short AO3 work or series labels otherwise. Full URLs and detailed subprocess errors remain in the diagnostic log, while fatal terminal output is limited to a concise summary and the log location.
 
-FicHub is a cache, not an independent source of AO3 updates. When AO3 denies access, the downloader cannot confirm whether FicHub has the latest chapter or text. The downloader checks cached chapter counts against its persistent history and any EPUB still in the output folder. Existing books outside that folder are not imported automatically, so a fresh or upgraded installation may not have a known count yet. Without a known count, it keeps the URL queued unless `allow_unverified_ao3_cache=true`; even then, a saved cached copy does not remove the URL from the retry queue. It never substitutes a different work based on a similar title.
+FicHub is a cache, not an independent source of AO3 updates. When AO3 denies access, the downloader cannot confirm whether FicHub has the latest chapter or text. The downloader checks cached chapter counts against its persistent history and any EPUB still in the output folder. Existing books outside that folder are not imported automatically unless `browser_epub_folder` is configured; a fresh or upgraded installation may not have a known count yet. Without a known count, it keeps the URL queued unless `allow_unverified_ao3_cache=true`; even then, a saved cached copy does not remove the URL from the retry queue. It never substitutes a different work based on a similar title.
 
 ## Updates
 
@@ -54,6 +59,13 @@ Every update is staged and validated before installation. The updater requires a
 ## Configuration
 
 The supplied `downloader.example.ini` and `fanficfare.example.ini` document the initial settings. The installer copies them into `user` only when the corresponding personal file does not already exist.
+
+To process an AO3 EPUB downloaded manually in Chrome, set `browser_epub_folder` to Chrome's download directory in `user\downloader.ini`. Leave it blank to disable importing. On the next run, a queued AO3 work is imported only when the EPUB's original-work attribution matches its URL and its chapter count exceeds the recorded count and any existing output copy. The original file is not moved or deleted.
+
+```ini
+[paths]
+browser_epub_folder=C:\Users\YourName\Downloads
+```
 
 Update prompts can be disabled without disabling manual updates:
 
