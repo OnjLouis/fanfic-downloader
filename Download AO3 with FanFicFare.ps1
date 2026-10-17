@@ -3,6 +3,8 @@ param(
     [switch] $PrepareOnly,
     [switch] $LibraryOnly,
     [switch] $SkipUpdateCheck,
+    [switch] $BrowserImportsOnly,
+    [switch] $SkipFailedQueue,
     [string] $PrepareInput,
     [string] $PrepareResult,
     [Parameter(Position = 0, ValueFromRemainingArguments = $true)]
@@ -205,6 +207,20 @@ function Move-LegacyFailedUrlQueue {
     $null = Remove-FileWithRetry -Path $SourcePath
 }
 
+function Get-FileSha256 {
+    param([string] $Path)
+
+    $stream = [System.IO.File]::OpenRead($Path)
+    $algorithm = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return [System.BitConverter]::ToString($algorithm.ComputeHash($stream)).Replace('-', '')
+    }
+    finally {
+        $algorithm.Dispose()
+        $stream.Dispose()
+    }
+}
+
 function Test-FilesEquivalent {
     param(
         [string] $FirstPath,
@@ -216,8 +232,7 @@ function Test-FilesEquivalent {
     if ($first.Length -ne $second.Length) {
         return $false
     }
-    return (Get-FileHash -LiteralPath $FirstPath -Algorithm SHA256 -ErrorAction Stop).Hash -eq
-        (Get-FileHash -LiteralPath $SecondPath -Algorithm SHA256 -ErrorAction Stop).Hash
+    return (Get-FileSha256 -Path $FirstPath) -eq (Get-FileSha256 -Path $SecondPath)
 }
 
 function Move-LegacyUserFile {
@@ -320,7 +335,10 @@ $downloadFormat = (Get-ConfigValue -Config $settings -Section "download" -Key "f
 $openAfterDownload = Get-ConfigBool -Config $settings -Section "download" -Key "open_after_download" -Default $true
 $readClipboard = Get-ConfigBool -Config $settings -Section "download" -Key "read_clipboard" -Default $true
 $autoStartClipboard = Get-ConfigBool -Config $settings -Section "download" -Key "auto_start_clipboard" -Default $true
-$preferNative = Get-ConfigBool -Config $settings -Section "download" -Key "prefer_native" -Default $true
+$preferNative = Get-ConfigBool -Config $settings -Section "download" -Key "prefer_native" -Default $false
+$preferAo3Mirror = Get-ConfigBool -Config $settings -Section "download" -Key "prefer_ao3_mirror" -Default $false
+$ao3MirrorDomain = (Get-ConfigValue -Config $settings -Section "download" -Key "ao3_mirror_domain" -Default "archiveofourown.gay").Trim().ToLowerInvariant()
+$deleteImportedBrowserEpubs = Get-ConfigBool -Config $settings -Section "download" -Key "delete_imported_browser_epubs" -Default $false
 $useFichub = Get-ConfigBool -Config $settings -Section "download" -Key "use_fichub" -Default $true
 $useFichubForAo3 = Get-ConfigBool -Config $settings -Section "download" -Key "use_fichub_for_ao3" -Default $true
 $allowUnverifiedAo3Cache = Get-ConfigBool -Config $settings -Section "download" -Key "allow_unverified_ao3_cache" -Default $false
@@ -372,7 +390,12 @@ $pageCss = Get-ConfigFileText -Path $pageCssPath -Default $defaultPageCss
 New-Item -ItemType Directory -Force -Path $logDir, $outDir | Out-Null
 
 $stamp = Get-Date -Format "yyyy-MM-dd_HHmmss"
-$logFile = Initialize-DownloaderLog -LogDirectory $logDir
+$logFile = if ($PrepareOnly -or $LibraryOnly) {
+    Join-Path $logDir 'downloader.log'
+}
+else {
+    Initialize-DownloaderLog -LogDirectory $logDir
+}
 $started = Get-Date
 $stageDir = Join-Path $env:TEMP "ao3-downloader-$stamp-$PID"
 if (-not $LibraryOnly) {
@@ -390,6 +413,7 @@ Remove-AbandonedQueueArtifacts -Directory (Split-Path -Parent $failedUrlFile)
 $failedUrls = @()
 $hadErrors = $false
 $chapterHistoryFile = Join-Path $userDir "chapter-history.json"
+$filenameHistoryFile = Join-Path $userDir "filename-history.json"
 
 function Write-Log {
     param([string] $Message)
@@ -566,6 +590,15 @@ function Invoke-StartupUpdateCheck {
     }
 }
 
+function Test-CanPrompt {
+    try {
+        return $Host.Name -eq 'ConsoleHost' -and -not [Console]::IsInputRedirected -and -not [Console]::IsOutputRedirected
+    }
+    catch {
+        return $false
+    }
+}
+
 function Close-WithError {
     param(
         [int] $Code,
@@ -579,7 +612,7 @@ function Close-WithError {
     Write-Log ""
     Write-Log "Log saved to: `"$logFile`""
     Write-Host "Log saved to: `"$logFile`""
-    if ($pauseOnError) {
+    if ($pauseOnError -and (Test-CanPrompt)) {
         Write-Host ""
         Read-Host "Press Enter to close"
     }
@@ -683,6 +716,23 @@ function Get-PotentialSuccessfulEpubs {
     }
 
     return @($fics + $stageFics | Where-Object { $_ } | Sort-Object FullName -Unique)
+}
+
+function Get-UnretrievedFanFicFareUrls {
+    param([string[]] $Urls)
+
+    if ($downloadFormat -ne 'epub') { return @($Urls) }
+    $retrievedKeys = @{}
+    foreach ($file in @(Get-PotentialSuccessfulEpubs)) {
+        try {
+            $sourceUrl = Get-EpubSourceUrl -EpubPath $file.FullName -CandidateUrls $Urls
+            if ($sourceUrl) { $retrievedKeys[(Get-DownloadStoryKey $sourceUrl)] = $true }
+        }
+        catch {
+            continue
+        }
+    }
+    return @($Urls | Where-Object { -not $retrievedKeys.ContainsKey((Get-DownloadStoryKey $_)) })
 }
 
 function Test-FanFicFareLoginFailure {
@@ -1511,6 +1561,139 @@ function Get-SafeFileName {
     return $Name
 }
 
+function Get-StoryKey {
+    param([string] $StoryUrl)
+
+    if ($StoryUrl -match '^https?://archiveofourown\.org/works/(?<id>\d+)(?:[/?#]|$)') {
+        return "ao3:$($Matches['id'])"
+    }
+    return $null
+}
+
+function Test-StoryFilenameHistoryEntry {
+    param([string] $Key, [string] $FileName)
+
+    return $Key -match '^ao3:\d+$' -and
+        -not [string]::IsNullOrWhiteSpace($FileName) -and
+        $FileName -ceq [IO.Path]::GetFileName($FileName) -and
+        $FileName -notmatch '[\\/:*?"<>|]' -and
+        $FileName.ToLowerInvariant().EndsWith('.epub')
+}
+
+function Read-StoryFilenameHistory {
+    param([string] $Path)
+
+    $history = @{}
+    if (-not (Test-Path -LiteralPath $Path)) { return $history }
+    $data = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json -ErrorAction Stop
+    if ($null -eq $data -or $data -isnot [pscustomobject]) {
+        throw 'Filename history is not a JSON object.'
+    }
+    foreach ($property in $data.PSObject.Properties) {
+        $name = [string]$property.Value
+        if (-not (Test-StoryFilenameHistoryEntry -Key $property.Name -FileName $name)) {
+            throw 'Filename history contains an invalid story key or filename.'
+        }
+        $history[$property.Name] = $name
+    }
+    return $history
+}
+
+function Save-StoryFilenameHistory {
+    param([string] $Path, [hashtable] $History)
+
+    $orderedHistory = [ordered]@{}
+    foreach ($key in @($History.Keys | Sort-Object)) {
+        $name = [string]$History[$key]
+        if (-not (Test-StoryFilenameHistoryEntry -Key $key -FileName $name)) {
+            throw 'Refusing to save an invalid filename history entry.'
+        }
+        $orderedHistory[$key] = $name
+    }
+    $directory = Split-Path -Parent $Path
+    $temporary = Join-Path $directory ('.filename-history-' + [guid]::NewGuid().ToString('N') + '.tmp')
+    $backup = "$Path.backup-" + [guid]::NewGuid().ToString('N')
+    try {
+        $json = ConvertTo-Json -InputObject $orderedHistory -Depth 3
+        [IO.File]::WriteAllText($temporary, $json, [Text.UTF8Encoding]::new($false))
+        if (Test-Path -LiteralPath $Path) {
+            [IO.File]::Replace($temporary, $Path, $backup, $true)
+        }
+        else {
+            [IO.File]::Move($temporary, $Path)
+        }
+    }
+    finally {
+        Remove-Item -LiteralPath $temporary, $backup -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-StoryOutputFileName {
+    param(
+        [string] $StoryUrl,
+        [string] $ProposedName,
+        [string] $OutputFolder,
+        [hashtable] $FilenameHistory
+    )
+
+    $key = Get-StoryKey -StoryUrl $StoryUrl
+    if (-not $key -or -not $ProposedName.ToLowerInvariant().EndsWith('.epub')) {
+        return $ProposedName
+    }
+
+    $fileName = $ProposedName
+    $historyHasKey = $FilenameHistory.ContainsKey($key)
+    if ($historyHasKey) {
+        $fileName = [string]$FilenameHistory[$key]
+        $rememberedPath = Join-Path $OutputFolder $fileName
+        if (Test-Path -LiteralPath $rememberedPath) {
+            try {
+                if ((Get-EpubSourceUrl -EpubPath $rememberedPath -CandidateUrls @($StoryUrl)) -eq $StoryUrl) {
+                    return $fileName
+                }
+            }
+            catch {
+                Write-Log "Could not inspect existing EPUB identity: $fileName`: $($_.Exception.Message)"
+            }
+        }
+    }
+    $proposedPath = Join-Path $OutputFolder $ProposedName
+    if (Test-Path -LiteralPath $proposedPath) {
+        try {
+            if ((Get-EpubSourceUrl -EpubPath $proposedPath -CandidateUrls @($StoryUrl)) -eq $StoryUrl) {
+                return $ProposedName
+            }
+        }
+        catch {
+            Write-Log "Could not inspect existing EPUB identity: $ProposedName`: $($_.Exception.Message)"
+        }
+    }
+    $matchingNames = @()
+    foreach ($existing in @(Get-ChildItem -LiteralPath $OutputFolder -Filter '*.epub' -File -ErrorAction Stop)) {
+        try {
+            if ((Get-EpubSourceUrl -EpubPath $existing.FullName -CandidateUrls @($StoryUrl)) -eq $StoryUrl) {
+                $matchingNames += $existing.Name
+            }
+        }
+        catch {
+            Write-Log "Could not inspect existing EPUB identity: $($existing.Name): $($_.Exception.Message)"
+        }
+    }
+    if ($matchingNames.Count -gt 1) {
+        throw "More than one existing EPUB matches $key; cannot choose a stable filename."
+    }
+    if ($matchingNames.Count -eq 1) { $fileName = $matchingNames[0] }
+
+    $destination = Join-Path $OutputFolder $fileName
+    if (Test-Path -LiteralPath $destination) {
+        $existingUrl = Get-EpubSourceUrl -EpubPath $destination -CandidateUrls @($StoryUrl)
+        if ($existingUrl -ne $StoryUrl) {
+            throw "Cannot replace $fileName because it belongs to another story or its identity cannot be verified."
+        }
+    }
+    return $fileName
+}
+
 function Get-PlainHtmlText {
     param([string] $Html)
 
@@ -1860,6 +2043,12 @@ function Test-FichubSourceMatch {
     return $requested.Success -and $cached.Success -and $requested.Groups['id'].Value -eq $cached.Groups['id'].Value
 }
 
+function Get-NativeAo3DownloadUrl {
+    param([string] $WorkId, [string] $Format)
+
+    return "https://download.archiveofourown.org/downloads/$WorkId/work.$Format"
+}
+
 function Download-NativeAo3Epub {
     param([string] $WorkUrl)
 
@@ -1870,7 +2059,7 @@ function Download-NativeAo3Epub {
 
     $workId = $Matches['id']
     $stamp = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-    $downloadUrl = "https://download.archiveofourown.org/downloads/$workId/work.epub?updated_at=$stamp"
+    $downloadUrl = Get-NativeAo3DownloadUrl -WorkId $workId -Format 'epub'
     $tempFile = Join-Path $env:TEMP "ao3-native-$workId-$stamp.epub"
 
     Write-Status "Trying AO3 native EPUB download for work $workId."
@@ -1942,7 +2131,7 @@ function Download-NativeAo3File {
 
     $workId = $Matches['id']
     $downloadStamp = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-    $downloadUrl = "https://download.archiveofourown.org/downloads/$workId/work.$downloadFormat`?updated_at=$downloadStamp"
+    $downloadUrl = Get-NativeAo3DownloadUrl -WorkId $workId -Format $downloadFormat
     $tempFile = Join-Path $env:TEMP "ao3-native-$workId-$downloadStamp.$downloadFormat"
 
     Write-Status "Trying AO3 native $($downloadFormat.ToUpperInvariant()) download for work $workId."
@@ -2141,7 +2330,7 @@ function Download-NativeAo3HtmlAsEpub {
 
     $workId = $Matches['id']
     $htmlStamp = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-    $downloadUrl = "https://download.archiveofourown.org/downloads/$workId/work.html?updated_at=$htmlStamp"
+    $downloadUrl = Get-NativeAo3DownloadUrl -WorkId $workId -Format 'html'
     $tempHtml = Join-Path $env:TEMP "ao3-native-$workId-$htmlStamp.html"
 
     Write-Status "Trying AO3 native HTML fallback for work $workId."
@@ -2399,6 +2588,53 @@ function Invoke-FanFicFareDownload {
         [string[]] $ExtraConfigPaths = @()
     )
 
+    $stdoutParts = New-Object System.Collections.Generic.List[string]
+    $stderrParts = New-Object System.Collections.Generic.List[string]
+    $exitCode = 0
+    $timedOut = $false
+    for ($index = 0; $index -lt $DownloadUrls.Count; $index++) {
+        $url = $DownloadUrls[$index]
+        Write-Status "Attempting story $($index + 1) of $($DownloadUrls.Count): $(Get-StoryDisplayName $url)"
+        try {
+            $result = Invoke-FanFicFareDownloadProcess -DownloadUrls @($url) -Attempt "$Attempt-$index" -ExtraConfigPaths $ExtraConfigPaths
+        }
+        catch {
+            $result = [pscustomobject]@{ ExitCode = 1; Stdout = ''; Stderr = $_.Exception.Message; TimedOut = $false }
+            Write-Log "FanFicFare process failed for $url`: $($result.Stderr)"
+        }
+        if ($result.Stdout) { $stdoutParts.Add([string]$result.Stdout) }
+        if ($result.Stderr) { $stderrParts.Add([string]$result.Stderr) }
+        $loginFailed = Test-FanFicFareLoginFailure -Stdout $result.Stdout -Stderr $result.Stderr
+        if ($result.ExitCode -ne 0 -or $result.TimedOut -or $loginFailed -or "$($result.Stdout)`n$($result.Stderr)" -match '(?m)\bFailed:') {
+            $exitCode = if ($result.TimedOut) { 124 } elseif ($exitCode -eq 0) { 4 } else { $exitCode }
+            $timedOut = $timedOut -or $result.TimedOut
+            if ("$($result.Stdout)`n$($result.Stderr)" -notmatch [regex]::Escape("URL($url) Failed")) {
+                $reason = if ($loginFailed) { 'AO3 login was not completed.' } elseif ($result.TimedOut) { 'Download attempt timed out.' } else { 'FanFicFare did not complete the download.' }
+                $failureLine = "URL($url) Failed: $reason"
+                $stdoutParts.Add($failureLine)
+                Write-Log $failureLine
+            }
+            Write-Status 'Story attempt failed; continuing with the remaining stories.'
+        }
+        else {
+            Write-Status 'Story retrieval finished; EPUB validation follows.'
+        }
+    }
+    return [pscustomobject]@{
+        ExitCode = $exitCode
+        Stdout = $stdoutParts -join "`n"
+        Stderr = $stderrParts -join "`n"
+        TimedOut = $timedOut
+    }
+}
+
+function Invoke-FanFicFareDownloadProcess {
+    param(
+        [string[]] $DownloadUrls,
+        [string] $Attempt,
+        [string[]] $ExtraConfigPaths = @()
+    )
+
     $stdoutFile = Join-Path $env:TEMP "fanficfare-$stamp-attempt-$Attempt.out"
     $stderrFile = Join-Path $env:TEMP "fanficfare-$stamp-attempt-$Attempt.err"
 
@@ -2460,8 +2696,10 @@ function Invoke-FanFicFareDownload {
         $stderr | Out-File -LiteralPath $logFile -Append -Encoding utf8
     }
 
+    $processExitCode = if ($timedOut) { 124 } else { $process.ExitCode }
+    $process.Dispose()
     return [pscustomobject]@{
-        ExitCode = if ($timedOut) { 124 } else { $process.ExitCode }
+        ExitCode = $processExitCode
         Stdout = $stdout
         Stderr = $stderr
         TimedOut = $timedOut
@@ -2486,26 +2724,44 @@ function New-TemporaryAo3LoginConfig {
         [string] $Password
     )
 
-    $tempConfig = Join-Path $env:TEMP "fanficfare-ao3-login-$stamp.ini"
+    $tempConfig = Join-Path $stageDir ("ao3-login-" + [guid]::NewGuid().ToString('N') + '.ini')
     $content = @(
         "[archiveofourown.org]",
         "username:$Username",
         "password:$Password"
     ) -join "`r`n"
-    [System.IO.File]::WriteAllText($tempConfig, $content, [System.Text.UTF8Encoding]::new($false))
+    try {
+        [System.IO.File]::WriteAllText($tempConfig, $content, [System.Text.UTF8Encoding]::new($false))
+    }
+    catch {
+        Remove-Item -LiteralPath $tempConfig -Force -ErrorAction SilentlyContinue
+        throw
+    }
     return $tempConfig
 }
 
 function New-TemporaryFanFicFareRuntimeConfig {
     $tempConfig = Join-Path $env:TEMP "fanficfare-ao3-runtime-$stamp.ini"
     $outputPattern = Join-Path $stageDir '${title}${formatext}'
+    $useGayMirror = if ($preferAo3Mirror -and $ao3MirrorDomain -eq "archiveofourown.gay") { "true" } else { "false" }
+    $useTransformativeWorksMirror = if ($preferAo3Mirror -and $ao3MirrorDomain -eq "archive.transformativeworks.org") { "true" } else { "false" }
     $content = @(
         "[defaults]",
         "output_filename:$outputPattern",
         "",
         "[archiveofourown.org]",
-        "user_agent:$userAgent"
-    ) -join "`r`n"
+        "user_agent:$userAgent",
+        "use_archiveofourown_gay:$useGayMirror",
+        "use_archive_transformativeworks_org:$useTransformativeWorksMirror",
+        "open_pages_in_browser:false"
+    )
+    if ($preferAo3Mirror) {
+        $content += @(
+            "use_browser_cache:false",
+            "use_browser_cache_only:false"
+        )
+    }
+    $content = $content -join "`r`n"
     [System.IO.File]::WriteAllText($tempConfig, $content, [System.Text.UTF8Encoding]::new($false))
     return $tempConfig
 }
@@ -2745,7 +3001,9 @@ function Get-Ao3BrowserEpubCandidate {
         [string] $WorkUrl,
         [string] $Folder,
         [int] $KnownChapterCount,
-        [string] $OutputFolder = ''
+        [string] $OutputFolder = '',
+        [hashtable] $FilenameHistory = @{},
+        [switch] $AllowKnownCountWithoutOutput
     )
 
     if ([string]::IsNullOrWhiteSpace($Folder) -or -not (Test-Path -LiteralPath $Folder -PathType Container)) {
@@ -2763,7 +3021,8 @@ function Get-Ao3BrowserEpubCandidate {
                 continue
             }
             $chapterCount = Get-EpubChapterCount -EpubPath $epub.FullName
-            if ($chapterCount -le $KnownChapterCount) {
+            if ($chapterCount -lt $KnownChapterCount -or
+                ($chapterCount -eq $KnownChapterCount -and -not $AllowKnownCountWithoutOutput)) {
                 continue
             }
             if (-not [string]::IsNullOrWhiteSpace($OutputFolder)) {
@@ -2771,9 +3030,11 @@ function Get-Ao3BrowserEpubCandidate {
                 if ([string]::IsNullOrWhiteSpace($title)) {
                     continue
                 }
-                $existingPath = Join-Path $OutputFolder "$(Get-SafeFileName $title).epub"
+                $proposedName = "$(Get-SafeFileName $title).epub"
+                $existingName = Get-StoryOutputFileName -StoryUrl $WorkUrl -ProposedName $proposedName -OutputFolder $OutputFolder -FilenameHistory $FilenameHistory
+                $existingPath = Join-Path $OutputFolder $existingName
                 if (Test-Path -LiteralPath $existingPath) {
-                    if ((Get-Ao3EpubOriginWorkId -EpubPath $existingPath) -ne $requestedId -or
+                    if ((Get-EpubSourceUrl -EpubPath $existingPath -CandidateUrls @($WorkUrl)) -ne $WorkUrl -or
                         $chapterCount -le (Get-EpubChapterCount -EpubPath $existingPath)) {
                         continue
                     }
@@ -2810,6 +3071,104 @@ function Get-Ao3EpubOriginWorkId {
         $zip.Dispose()
     }
 
+    return $null
+}
+
+function Get-SupportedBrowserEpubOriginUrl {
+    param([string] $EpubPath)
+
+    $maxEntryBytes = 262144
+    $maxFrontMatterEntries = 12
+    $maxNamedFrontMatterEntries = 4
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($EpubPath)
+    try {
+        $eligibleEntries = @($zip.Entries | Where-Object {
+            $_.FullName -match '\.(xhtml|html)$' -and $_.Length -gt 0 -and $_.Length -le $maxEntryBytes
+        })
+        $frontMatterEntries = @($eligibleEntries | Where-Object {
+            $_.FullName -match '(?i)(^|/)(introduction|intro|title|titlepage)\.(xhtml|html)$'
+        } | Select-Object -First $maxNamedFrontMatterEntries) +
+            @($eligibleEntries | Select-Object -First $maxFrontMatterEntries)
+        $seenEntries = @{}
+        foreach ($entry in $frontMatterEntries) {
+            if ($seenEntries.ContainsKey($entry.FullName)) {
+                continue
+            }
+            $seenEntries[$entry.FullName] = $true
+            $reader = [System.IO.StreamReader]::new($entry.Open())
+            try {
+                $buffer = New-Object char[] ($maxEntryBytes + 1)
+                $length = $reader.ReadBlock($buffer, 0, $buffer.Length)
+                if ($length -gt $maxEntryBytes) {
+                    continue
+                }
+                $content = [string]::new($buffer, 0, $length)
+            }
+            finally {
+                $reader.Dispose()
+            }
+            $ao3Origin = [regex]::Match($content, '(?is)Posted\s+originally\s+on\b.{0,500}?Archive\s+of\s+Our\s+Own.{0,500}?\bat\s*<a\b[^>]*\bhref\s*=\s*["'']https://archiveofourown\.org/works/(?<id>\d+)(?:[/?#][^"'']*)?["'']')
+            if ($ao3Origin.Success) {
+                return "https://archiveofourown.org/works/$($ao3Origin.Groups['id'].Value)"
+            }
+            if ($content -notmatch 'https://fichub\.net') {
+                continue
+            }
+            $ficHubOrigin = [regex]::Match($content, '(?is)Original\s+source:\s*<a\b[^>]*\bhref\s*=\s*["''](?<url>https://(?:www\.)?(?:fanfiction\.net|fictionpress\.com)/s/\d+(?:/\d+)?(?:/[^"''<>]*)?)["'']')
+            if ($ficHubOrigin.Success) {
+                return Convert-ToDownloadUrl $ficHubOrigin.Groups['url'].Value
+            }
+        }
+    }
+    finally {
+        $zip.Dispose()
+    }
+    return $null
+}
+
+function Get-FanFictionBrowserEpubCandidate {
+    param(
+        [string] $StoryUrl,
+        [string] $Folder,
+        [string] $OutputFolder,
+        [hashtable] $FilenameHistory = @{}
+    )
+
+    $storyKey = Get-DownloadStoryKey $StoryUrl
+    foreach ($epub in @(Get-ChildItem -LiteralPath $Folder -Filter '*.epub' -File -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending)) {
+        try {
+            $originUrl = Get-SupportedBrowserEpubOriginUrl -EpubPath $epub.FullName
+            if ([string]::IsNullOrWhiteSpace($originUrl) -or (Get-DownloadStoryKey $originUrl) -ne $storyKey) {
+                continue
+            }
+            $chapterCount = Get-EpubChapterCount -EpubPath $epub.FullName
+            $requiredChapterCount = Get-FanFictionChapterNumber $StoryUrl
+            if ($chapterCount -lt [Math]::Max(1, $requiredChapterCount)) {
+                continue
+            }
+            $title = Get-EpubTitle -EpubPath $epub.FullName
+            if ([string]::IsNullOrWhiteSpace($title)) {
+                continue
+            }
+            $existingName = Get-StoryOutputFileName -StoryUrl $StoryUrl -ProposedName "$(Get-SafeFileName $title).epub" -OutputFolder $OutputFolder -FilenameHistory $FilenameHistory
+            $existingPath = Join-Path $OutputFolder $existingName
+            if (Test-Path -LiteralPath $existingPath) {
+                $existingOrigin = Get-SupportedBrowserEpubOriginUrl -EpubPath $existingPath
+                if ([string]::IsNullOrWhiteSpace($existingOrigin) -or
+                    (Get-DownloadStoryKey $existingOrigin) -ne $storyKey -or
+                    $chapterCount -le (Get-EpubChapterCount -EpubPath $existingPath)) {
+                    continue
+                }
+            }
+            return $epub
+        }
+        catch {
+            continue
+        }
+    }
     return $null
 }
 
@@ -2859,9 +3218,26 @@ if ($LibraryOnly) {
     return
 }
 
+if ($preferAo3Mirror -and $ao3MirrorDomain -notin @("archiveofourown.gay", "archive.transformativeworks.org")) {
+    Close-WithError 2 "ERROR: ao3_mirror_domain must be archiveofourown.gay or archive.transformativeworks.org."
+}
+
+try {
+    $filenameHistory = Read-StoryFilenameHistory -Path $filenameHistoryFile
+}
+catch {
+    Close-WithError 2 "ERROR: Filename history could not be read; no files were downloaded or replaced. $($_.Exception.Message)"
+}
+
 Write-Status "Downloader started at $($started.ToString('yyyy-MM-dd HH:mm:ss'))"
+Write-Log "Script SHA-256: $(Get-FileSha256 -Path $scriptFile)"
 Write-Log "App folder: `"$appDir`""
 Write-Status "Output folder: `"$outDir`""
+
+if ($BrowserImportsOnly -and ($downloadFormat -ne 'epub' -or [string]::IsNullOrWhiteSpace($browserEpubFolder) -or
+    -not (Test-Path -LiteralPath $browserEpubFolder -PathType Container))) {
+    Close-WithError 2 'ERROR: Browser import mode needs EPUB output and an existing browser_epub_folder in user\downloader.ini.'
+}
 
 if (Invoke-StartupUpdateCheck) {
     Write-Status "Update installed; restarting the requested download."
@@ -2873,7 +3249,10 @@ if (Invoke-StartupUpdateCheck) {
         "-ExecutionPolicy", "Bypass",
         "-File", $scriptFile,
         "-SkipUpdateCheck"
-    ) + @($UrlParts)
+    )
+    if ($BrowserImportsOnly) { $restartArguments += '-BrowserImportsOnly' }
+    if ($SkipFailedQueue) { $restartArguments += '-SkipFailedQueue' }
+    $restartArguments += @($UrlParts)
     & powershell.exe @restartArguments
     exit $LASTEXITCODE
 }
@@ -2884,9 +3263,6 @@ if ($fanficfareAvailable) {
 }
 else {
     Write-Log "FanFicFare executable not found at `"$fff`". FanFicFare backup is disabled."
-    if (-not $preferNative) {
-        Close-WithError 2 "ERROR: prefer_native is false, but FanFicFare was not found at `"$fff`""
-    }
 }
 
 $inputText = ($UrlParts -join " ").Trim()
@@ -2915,8 +3291,9 @@ if ($urls.Count -eq 0 -and [string]::IsNullOrWhiteSpace($inputText) -and $readCl
     }
 }
 
+$providedUrls = @($urls)
 $queuedFailedUrls = @(Read-FailedUrlQueue)
-if ($retryFailedUrls -and $queuedFailedUrls.Count -gt 0) {
+if ($retryFailedUrls -and -not $SkipFailedQueue -and $queuedFailedUrls.Count -gt 0) {
     $freshUrlCount = $urls.Count
     $freshStoryKeys = @{}
     foreach ($freshUrl in $urls) {
@@ -2939,10 +3316,47 @@ if ($retryFailedUrls -and $queuedFailedUrls.Count -gt 0) {
     }
 }
 elseif ($queuedFailedUrls.Count -gt 0) {
-    Write-Log "$($queuedFailedUrls.Count) failed URL(s) remain queued in `"$failedUrlFile`"."
+    if ($SkipFailedQueue) {
+        Write-Status "Skipping $($queuedFailedUrls.Count) queued URL(s) for this run; the queue remains intact."
+    }
+    else {
+        Write-Log "$($queuedFailedUrls.Count) failed URL(s) remain queued in `"$failedUrlFile`"."
+    }
 }
 
-if ($urls.Count -eq 0) {
+$browserOnlyStoryKeys = @{}
+if ($downloadFormat -eq 'epub' -and -not [string]::IsNullOrWhiteSpace($browserEpubFolder) -and
+    (Test-Path -LiteralPath $browserEpubFolder -PathType Container)) {
+    $providedStoryKeys = @{}
+    foreach ($url in $urls) {
+        $providedStoryKeys[(Get-DownloadStoryKey $url)] = $true
+    }
+    $discoveredBrowserUrls = @()
+    foreach ($epub in @(Get-ChildItem -LiteralPath $browserEpubFolder -Filter '*.epub' -File -ErrorAction SilentlyContinue)) {
+        try {
+            $originUrl = Get-SupportedBrowserEpubOriginUrl -EpubPath $epub.FullName
+            if (-not [string]::IsNullOrWhiteSpace($originUrl)) {
+                $discoveredBrowserUrls += $originUrl
+            }
+        }
+        catch {
+            continue
+        }
+    }
+    $discoveredBrowserUrls = @(Select-PreferredDownloadUrls -Urls $discoveredBrowserUrls)
+    foreach ($originUrl in $discoveredBrowserUrls) {
+        $storyKey = Get-DownloadStoryKey $originUrl
+        if (-not $providedStoryKeys.ContainsKey($storyKey)) {
+            $browserOnlyStoryKeys[$storyKey] = $true
+        }
+    }
+    if ($discoveredBrowserUrls.Count -gt 0) {
+        $urls = @(Merge-SupportedDownloadUrls -PrimaryUrls $urls -AdditionalUrls $discoveredBrowserUrls)
+        Write-Status "Found $($discoveredBrowserUrls.Count) supported story EPUB(s) in browser downloads."
+    }
+}
+
+if ($urls.Count -eq 0 -and -not $BrowserImportsOnly) {
     Write-Host "Enter one or more AO3 or FanFiction.net work URLs, for example:"
     Write-Host "  https://archiveofourown.org/works/51222748"
     Write-Host "  https://www.fanfiction.net/s/14196398/1/Weaponized-Cuteness"
@@ -2961,6 +3375,9 @@ if ($urls.Count -eq 0) {
 }
 
 if ($urls.Count -eq 0) {
+    if ($BrowserImportsOnly) {
+        Close-WithError 4 "ERROR: No supported AO3, FanFiction.net, or FictionPress EPUB was found in `"$browserEpubFolder`"."
+    }
     Close-WithError 2 "ERROR: No valid URL was entered."
 }
 
@@ -2976,14 +3393,18 @@ $fics = @()
 $ficUrlByPath = @{}
 $fanficfareUrls = @()
 $importedUrls = @{}
+$browserImportsByUrl = @{}
 if ($downloadFormat -eq 'epub' -and -not [string]::IsNullOrWhiteSpace($browserEpubFolder)) {
-    Write-Status 'Checking browser-downloaded AO3 EPUBs.'
+    Write-Status 'Checking browser-downloaded EPUBs from supported sites.'
     foreach ($url in $urls) {
-        if ($url -notmatch '^https?://archiveofourown\.org/works/\d+') {
-            continue
+        $browserEpub = $null
+        if ($url -match '^https?://archiveofourown\.org/works/\d+') {
+            $knownChapterCount = Get-KnownAo3ChapterCount -StoryUrl $url
+            $browserEpub = Get-Ao3BrowserEpubCandidate -WorkUrl $url -Folder $browserEpubFolder -KnownChapterCount $knownChapterCount -OutputFolder $outDir -FilenameHistory $filenameHistory -AllowKnownCountWithoutOutput:$BrowserImportsOnly
         }
-        $knownChapterCount = Get-KnownAo3ChapterCount -StoryUrl $url
-        $browserEpub = Get-Ao3BrowserEpubCandidate -WorkUrl $url -Folder $browserEpubFolder -KnownChapterCount $knownChapterCount -OutputFolder $outDir
+        elseif (Test-FanFictionUrl $url) {
+            $browserEpub = Get-FanFictionBrowserEpubCandidate -StoryUrl $url -Folder $browserEpubFolder -OutputFolder $outDir -FilenameHistory $filenameHistory
+        }
         if (-not $browserEpub) {
             continue
         }
@@ -3000,10 +3421,19 @@ if ($downloadFormat -eq 'epub' -and -not [string]::IsNullOrWhiteSpace($browserEp
             }
             $canCleanStage = $true
             Copy-Item -LiteralPath $browserEpub.FullName -Destination $stagedPath -ErrorAction Stop
+            $sourceHash = Get-FileSha256 -Path $browserEpub.FullName
+            $stagedHash = Get-FileSha256 -Path $stagedPath
+            if ($sourceHash -ne $stagedHash) {
+                throw 'Browser EPUB changed while it was being copied.'
+            }
             $importedFic = Get-Item -LiteralPath $stagedPath
             $fics += $importedFic
             $ficUrlByPath[$importedFic.FullName.ToLowerInvariant()] = $url
             $importedUrls[$url] = $true
+            $browserImportsByUrl[$url] = [pscustomobject]@{
+                Path = $browserEpub.FullName
+                Sha256 = $sourceHash
+            }
             Write-Status "Using browser-downloaded EPUB: $title"
         }
         catch {
@@ -3011,17 +3441,33 @@ if ($downloadFormat -eq 'epub' -and -not [string]::IsNullOrWhiteSpace($browserEp
                 Remove-Item -LiteralPath $stagedPath -Force -ErrorAction SilentlyContinue
             }
             Write-Log "Browser EPUB import failed for $url`: $($_.Exception.Message)"
-            Write-Status 'Browser EPUB could not be imported; trying the usual download routes.'
+            Write-Status 'Browser EPUB could not be staged; it remains in the download folder.'
         }
     }
 }
-if ($preferNative) {
+if ($BrowserImportsOnly) {
+    $missingProvidedUrls = @($providedUrls | Where-Object { -not $importedUrls.ContainsKey($_) })
+    if ($missingProvidedUrls.Count -gt 0) {
+        Save-FailedUrls -Urls $missingProvidedUrls
+        Write-Status "$($missingProvidedUrls.Count) supplied URL(s) had no matching browser EPUB and remain queued."
+    }
+    if ($importedUrls.Count -eq 0) {
+        Close-WithError 4 "ERROR: No new matching EPUB from a supported site was found in `"$browserEpubFolder`"."
+    }
+    Write-Status 'Browser import mode: skipping online download routes.'
+}
+elseif ($preferNative) {
     Write-Status 'Trying native download routes for remaining fics.'
     foreach ($url in $urls) {
-        if ($importedUrls.ContainsKey($url)) {
+        if ($importedUrls.ContainsKey($url) -or $browserOnlyStoryKeys.ContainsKey((Get-DownloadStoryKey $url))) {
             continue
         }
         if ($url -match '^https?://archiveofourown\.org/works/\d+') {
+            if ($preferAo3Mirror) {
+                Write-Status 'Trying FanFicFare through the AO3 alternate domain.'
+                $fanficfareUrls += $url
+                continue
+            }
             $nativeFic = Invoke-NativeAo3Download -WorkUrl $url
             if ($nativeFic) {
                 $fics += $nativeFic
@@ -3035,8 +3481,12 @@ if ($preferNative) {
                             $fics += $cachedFic
                             $ficUrlByPath[$cachedFic.FullName.ToLowerInvariant()] = $url
                             Write-Status "Saved FicHub's cached copy; keeping this AO3 work queued until a direct download verifies the latest chapters."
+                            $failedUrls += $url
                         }
-                        $failedUrls += $url
+                        else {
+                            Write-Status 'FicHub has no newer copy; trying FanFicFare backup.'
+                            $fanficfareUrls += $url
+                        }
                     }
                     catch {
                         Write-Log "FicHub AO3 fallback failed for $url`: $($_.Exception.Message)"
@@ -3082,7 +3532,7 @@ if ($preferNative) {
 else {
     Write-Status "Trying FanFicFare first."
     foreach ($url in $urls) {
-        if ($importedUrls.ContainsKey($url)) {
+        if ($importedUrls.ContainsKey($url) -or $browserOnlyStoryKeys.ContainsKey((Get-DownloadStoryKey $url))) {
             continue
         }
         if (Test-FanFictionUrl $url) {
@@ -3115,7 +3565,12 @@ else {
 }
 
 if (@($fics).Count -gt 0) {
-    Write-Status "Retrieved $(@($fics).Count) fic(s) before the FanFicFare backup."
+    if ($BrowserImportsOnly) {
+        Write-Status "Imported $(@($fics).Count) browser EPUB(s)."
+    }
+    else {
+        Write-Status "Retrieved $(@($fics).Count) fic(s) before the FanFicFare backup."
+    }
 }
 
 if (@($fanficfareUrls).Count -gt 0) {
@@ -3129,7 +3584,12 @@ if (@($fanficfareUrls).Count -gt 0) {
     }
     else {
     Write-Log ""
-    Write-Status "Native download could not handle $(@($fanficfareUrls).Count) URL(s); trying FanFicFare backup."
+    if ($preferAo3Mirror) {
+        Write-Status "Trying FanFicFare for $(@($fanficfareUrls).Count) fic(s) via $ao3MirrorDomain."
+    }
+    else {
+        Write-Status "Trying FanFicFare for $(@($fanficfareUrls).Count) fic(s) via the main AO3 domain and any configured passive browser cache."
+    }
     $runtimeFanficfareConfig = New-TemporaryFanFicFareRuntimeConfig
 
     Push-Location $appDir
@@ -3181,21 +3641,29 @@ if (@($fanficfareUrls).Count -gt 0) {
             $failureCode = 4
         }
         $combinedOutput = "$stdout`n$stderr"
+        $unretrievedFanficfareUrls = @(Get-UnretrievedFanFicFareUrls -Urls $fanficfareUrls)
         $reportedFailedUrls = @([regex]::Matches($combinedOutput, 'URL\((https?://[^)]+)\)\s+Failed') | ForEach-Object {
             $_.Groups[1].Value
         })
         if ($reportedFailedUrls.Count -gt 0) {
-            $failedUrls += $reportedFailedUrls
+            $failedUrls += @($reportedFailedUrls | Where-Object { $_ -in $unretrievedFanficfareUrls })
         }
         elseif ($result.TimedOut -or $exitCode -ne 0 -or $fanficfareLoginFailed) {
-            $failedUrls += $fanficfareUrls
+            $failedUrls += $unretrievedFanficfareUrls
         }
 
         if ($combinedOutput -match '525 Server Error') {
             Write-Status "FanFicFare backup also hit AO3 525."
         }
-        if ($combinedOutput -match '403 Client Error: Forbidden for url: https://archiveofourown\.org/users/login') {
-            Write-Status "AO3 says this work needs login. FanFicFare's first login attempt was blocked with 403 Forbidden."
+        if ($fanficfareLoginFailed -or $combinedOutput -match '403 Client Error: Forbidden for url: https://archiveofourown\.org/users/login') {
+            Write-Status "AO3 login is required or the configured login was not accepted."
+            if (-not (Test-CanPrompt)) {
+                Write-Status 'This run cannot prompt for credentials. Run the downloader in an interactive terminal, or configure your AO3 login in user\fanficfare_personal.ini. The work remains queued.'
+            }
+            elseif ($preferAo3Mirror -and $ao3MirrorDomain -eq 'archive.transformativeworks.org') {
+                Write-Status 'The selected alternate domain does not support FanFicFare login. Use the main AO3 route for login-required works.'
+            }
+            else {
             Write-Host "Enter AO3 login details to retry once, or leave username blank to cancel."
             $loginCancelled = $false
             $ao3UsernameInput = Read-Host "AO3 username"
@@ -3207,7 +3675,7 @@ if (@($fanficfareUrls).Count -gt 0) {
             }
             if ([string]::IsNullOrWhiteSpace($ao3Username)) {
                 $loginCancelled = $true
-                $failedUrls += $fanficfareUrls
+                $failedUrls += $unretrievedFanficfareUrls
                 if (@(Get-PotentialSuccessfulEpubs).Count -eq 0) {
                     Close-WithError $failureCode "ERROR: AO3 login was required, but no username was entered."
                 }
@@ -3219,7 +3687,7 @@ if (@($fanficfareUrls).Count -gt 0) {
                 $ao3Password = ConvertFrom-SecureStringToPlainText $securePassword
                 if ([string]::IsNullOrWhiteSpace($ao3Password)) {
                     $loginCancelled = $true
-                    $failedUrls += $fanficfareUrls
+                    $failedUrls += $unretrievedFanficfareUrls
                     if (@(Get-PotentialSuccessfulEpubs).Count -eq 0) {
                         Close-WithError $failureCode "ERROR: AO3 login was required, but no password was entered."
                     }
@@ -3233,7 +3701,7 @@ if (@($fanficfareUrls).Count -gt 0) {
                     Write-Status "Retrying once with supplied AO3 login."
                     Push-Location $appDir
                     try {
-                        $loginResult = Invoke-FanFicFareDownload -DownloadUrls $fanficfareUrls -Attempt "login" -ExtraConfigPaths @($runtimeFanficfareConfig, $loginConfig)
+                        $loginResult = Invoke-FanFicFareDownload -DownloadUrls $unretrievedFanficfareUrls -Attempt "login" -ExtraConfigPaths @($runtimeFanficfareConfig, $loginConfig)
                     }
                     finally {
                         Pop-Location
@@ -3244,12 +3712,13 @@ if (@($fanficfareUrls).Count -gt 0) {
                     $stderr = $loginResult.Stderr
                     Write-Status "FanFicFare login retry finished with exit code $exitCode."
                     $fanficfareReportedFailure = $stdout -match '(?m)\bFailed:' -or $stderr -match '(?m)\bFailed:'
-                    if ($exitCode -eq 0 -and -not $fanficfareReportedFailure) {
-                        $failedUrls = @($failedUrls | Where-Object { $_ -notin $fanficfareUrls })
+                    $fanficfareLoginFailed = Test-FanFicFareLoginFailure -Stdout $stdout -Stderr $stderr
+                    $failedUrls = @($failedUrls | Where-Object { $_ -notin $unretrievedFanficfareUrls })
+                    $failedUrls += @(Get-UnretrievedFanFicFareUrls -Urls $unretrievedFanficfareUrls)
+                    if ($exitCode -eq 0 -and -not $fanficfareReportedFailure -and -not $fanficfareLoginFailed) {
                         Write-Status "AO3 login retry succeeded."
                     }
                     else {
-                        $failedUrls += $fanficfareUrls
                         if (@(Get-PotentialSuccessfulEpubs).Count -eq 0) {
                             Close-WithError $failureCode "ERROR: AO3 login retry failed. AO3 may be blocking scripted login, or the work may be hidden/restricted in a way this downloader cannot access."
                         }
@@ -3259,7 +3728,9 @@ if (@($fanficfareUrls).Count -gt 0) {
                 finally {
                     Remove-Item -LiteralPath $loginConfig -ErrorAction SilentlyContinue
                     $ao3Password = $null
+                    $securePassword.Dispose()
                 }
+            }
             }
         }
         if ($exitCode -eq 124) {
@@ -3275,6 +3746,9 @@ if (@($fanficfareUrls).Count -gt 0) {
             if (@(Get-PotentialSuccessfulEpubs).Count -eq 0) {
                 if ($fanficfareLoginFailed) {
                     Close-WithError $failureCode "ERROR: AO3 requested login and FanFicFare could not complete it. The work remains queued for retry."
+                }
+                if ($preferAo3Mirror) {
+                    Close-WithError $failureCode 'ERROR: The alternate AO3 download failed. URLs remain queued. For an AO3 work, download its EPUB in Chrome and run Import Browser EPUBs.cmd.'
                 }
                 Close-WithError $failureCode "ERROR: Download failed. If AO3 shows a site challenge in Chrome, complete it, reload the story page once, then run this command again."
             }
@@ -3335,9 +3809,19 @@ if ($fics.Count -gt 0) {
                         throw "AO3 EPUB has $preparedChapterCount chapter(s), but at least $knownChapterCount are known. Refusing to replace the previous complete copy."
                     }
                 }
+                elseif (Test-FanFictionUrl $sourceUrl) {
+                    $requiredChapterCount = Get-FanFictionChapterNumber $sourceUrl
+                    if ($requiredChapterCount -gt 0) {
+                        $preparedChapterCount = Get-EpubChapterCount -EpubPath $workPath
+                        if ($preparedChapterCount -lt $requiredChapterCount) {
+                            throw "FanFiction.net/FictionPress EPUB has $preparedChapterCount chapter(s), but the requested URL points to chapter $requiredChapterCount."
+                        }
+                    }
+                }
             }
 
-            $finalPath = Join-Path $outDir $fic.Name
+            $finalName = Get-StoryOutputFileName -StoryUrl $sourceUrl -ProposedName $fic.Name -OutputFolder $outDir -FilenameHistory $filenameHistory
+            $finalPath = Join-Path $outDir $finalName
             $publishedFile = Publish-PreparedFile -SourcePath $workPath -DestinationPath $finalPath
             $preparedRecords += [pscustomobject]@{
                 File = $publishedFile
@@ -3353,7 +3837,22 @@ if ($fics.Count -gt 0) {
                     Write-Status "ERROR: File was saved, but AO3 chapter history could not be updated: $($_.Exception.Message)"
                 }
             }
-            Write-Status "Saved file: $($fic.Name)"
+            $storyKey = Get-StoryKey -StoryUrl $sourceUrl
+            if ($storyKey -and $downloadFormat -eq 'epub' -and $filenameHistory[$storyKey] -cne $finalName) {
+                try {
+                    $updatedHistory = @{}
+                    foreach ($key in $filenameHistory.Keys) { $updatedHistory[$key] = $filenameHistory[$key] }
+                    $updatedHistory[$storyKey] = $finalName
+                    Save-StoryFilenameHistory -Path $filenameHistoryFile -History $updatedHistory
+                    $filenameHistory = $updatedHistory
+                }
+                catch {
+                    $hadErrors = $true
+                    $failedUrls += $sourceUrl
+                    Write-Status "ERROR: File was saved, but its stable filename could not be remembered: $($_.Exception.Message)"
+                }
+            }
+            Write-Status "Saved file: $finalName"
         }
         catch {
             $hadErrors = $true
@@ -3410,7 +3909,43 @@ if ($fics.Count -gt 0) {
     if (@($failedUrls).Count -gt 0) {
         Save-FailedUrls -Urls $failedUrls
     }
-    $failedUrlCount = @(Read-FailedUrlQueue).Count
+    $remainingQueuedUrls = @(Read-FailedUrlQueue)
+    $failedUrlCount = $remainingQueuedUrls.Count
+
+    if ($deleteImportedBrowserEpubs -and $browserImportsByUrl.Count -gt 0) {
+        $browserFolderPath = [System.IO.Path]::GetFullPath($browserEpubFolder).TrimEnd('\')
+        foreach ($record in $preparedRecords) {
+            if ([string]::IsNullOrWhiteSpace($record.Url) -or
+                -not $browserImportsByUrl.ContainsKey($record.Url) -or
+                $record.Url -notin $completedUrls -or
+                $record.Url -in $remainingQueuedUrls -or
+                -not (Test-Path -LiteralPath $record.File.FullName -PathType Leaf)) {
+                continue
+            }
+            $browserImport = $browserImportsByUrl[$record.Url]
+            try {
+                if (-not (Test-Path -LiteralPath $browserImport.Path -PathType Leaf)) {
+                    continue
+                }
+                $browserSource = Get-Item -LiteralPath $browserImport.Path -ErrorAction Stop
+                $sourceFolderPath = [System.IO.Path]::GetFullPath($browserSource.DirectoryName).TrimEnd('\')
+                if ($sourceFolderPath -ine $browserFolderPath -or
+                    ($browserSource.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                    $browserSource.FullName -ieq $record.File.FullName -or
+                    (Get-FileSha256 -Path $browserSource.FullName) -ne $browserImport.Sha256) {
+                    $hadErrors = $true
+                    Write-Status "ERROR: Browser EPUB changed after import; leaving it in place: $($browserSource.Name)"
+                    continue
+                }
+                Remove-Item -LiteralPath $browserSource.FullName -Force -ErrorAction Stop
+                Write-Status "Removed imported browser EPUB: $($browserSource.Name)"
+            }
+            catch {
+                $hadErrors = $true
+                Write-Status "ERROR: Book was saved, but its browser EPUB could not be removed: $($_.Exception.Message)"
+            }
+        }
+    }
 
     Write-Status ""
     Write-Status "Run summary:"
@@ -3438,7 +3973,7 @@ if ($fics.Count -gt 0) {
         }
     }
     Remove-DownloaderStage -Path $stageDir
-    if ($hadErrors -and $pauseOnError) {
+    if ($hadErrors -and $pauseOnError -and (Test-CanPrompt)) {
         Write-Host ""
         Read-Host "Press Enter to close"
     }
@@ -3450,6 +3985,12 @@ if ($fics.Count -gt 0) {
 else {
     if (@($failedUrls).Count -gt 0) {
         Close-WithError 4 "ERROR: No new $downloadFormat file was saved. $(@($failedUrls).Count) URL(s) remain queued in `"$failedUrlFile`"; see the status above for the reason."
+    }
+    if ($urls.Count -gt 0 -and $browserOnlyStoryKeys.Count -eq $urls.Count) {
+        Write-Status 'No newer supported browser EPUBs were found.'
+        Remove-Item -LiteralPath $logFile -ErrorAction SilentlyContinue
+        Remove-DownloaderStage -Path $stageDir
+        exit 0
     }
     Close-WithError 4 "ERROR: Download finished, but no new .$downloadFormat file was found in `"$outDir`"."
 }

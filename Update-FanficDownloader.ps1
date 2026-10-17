@@ -476,9 +476,7 @@ function Install-VerifiedUpdate {
         foreach ($file in $managedFiles) {
             $source = Join-Path $extracted $file
             $destination = Join-Path $targetRoot $file
-            $temporary = "$destination.$([guid]::NewGuid().ToString('N')).new"
-            Copy-Item -LiteralPath $source -Destination $temporary
-            Move-Item -LiteralPath $temporary -Destination $destination -Force
+            Move-Item -LiteralPath $source -Destination $destination -Force
         }
         Test-PowerShellFiles -Directory $targetRoot -Files $managedFiles
         if ((Get-InstalledVersion -Directory $targetRoot) -ne $ExpectedVersion) {
