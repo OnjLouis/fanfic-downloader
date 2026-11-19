@@ -1585,7 +1585,11 @@ function Read-StoryFilenameHistory {
 
     $history = @{}
     if (-not (Test-Path -LiteralPath $Path)) { return $history }
-    $data = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json -ErrorAction Stop
+    $maxHistoryBytes = 16MB
+    if ((Get-Item -LiteralPath $Path -ErrorAction Stop).Length -gt $maxHistoryBytes) {
+        throw 'Filename history is too large to read safely (limit: 16 MiB).'
+    }
+    $data = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
     if ($null -eq $data -or $data -isnot [pscustomobject]) {
         throw 'Filename history is not a JSON object.'
     }

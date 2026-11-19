@@ -49,6 +49,15 @@ try {
     $history = Read-StoryFilenameHistory -Path $historyPath
     Assert-Equal (Get-StoryOutputFileName -StoryUrl $url -ProposedName 'New Title.epub' -OutputFolder $output -FilenameHistory $history) 'Old Name.epub'
 
+    $unicodeKey = 'ao3:12345678'
+    $unicodeName = 'Original' + [char]0x2014 + 'Title.epub'
+    $history[$unicodeKey] = $unicodeName
+    for ($i = 0; $i -lt 3; $i++) {
+        Save-StoryFilenameHistory -Path $historyPath -History $history
+        $history = Read-StoryFilenameHistory -Path $historyPath
+        Assert-Equal $history[$unicodeKey] $unicodeName
+    }
+
     Set-Content -LiteralPath (Join-Path $output 'Moved Name.epub') -Value 'fixture'
     Assert-Equal (Get-StoryOutputFileName -StoryUrl $url -ProposedName 'New Title.epub' -OutputFolder $output -FilenameHistory $history) 'Moved Name.epub'
     Remove-Item -LiteralPath (Join-Path $output 'Moved Name.epub')
@@ -64,6 +73,14 @@ try {
     try { $null = Read-StoryFilenameHistory -Path $historyPath }
     catch { $invalid = $true }
     if (-not $invalid) { throw 'Expected invalid filename history to be rejected.' }
+
+    $oversized = $false
+    $stream = [IO.File]::OpenWrite($historyPath)
+    try { $stream.SetLength(16MB + 1) }
+    finally { $stream.Dispose() }
+    try { $null = Read-StoryFilenameHistory -Path $historyPath }
+    catch { $oversized = $_.Exception.Message -match 'too large' }
+    if (-not $oversized) { throw 'Expected oversized filename history to be rejected before parsing.' }
     Write-Host 'Story filename regression tests passed.'
 }
 finally {

@@ -54,7 +54,13 @@
     <h1>Fanfic Downloader</h1>
     <p>Fanfic Downloader is an accessible Windows downloader and EPUB cleaner for Archive of Our Own, FanFiction.net, and FictionPress. It accepts supported links from the command line or clipboard, retries previously failed stories, and avoids duplicate queue entries when different chapters of the same story are supplied.</p>
 
-    <h2>What's New in 1.0.9</h2>
+    <h2>What's New in 1.0.10</h2>
+    <ul>
+      <li>Filename history is read as UTF-8 on Windows PowerShell, so punctuation such as em dashes no longer becomes corrupted and grows the history on each save.</li>
+      <li>The downloader stops before loading a filename history larger than 16 MiB. It does not rewrite damaged history or remove anything from the failed-URL queue.</li>
+    </ul>
+
+    <h2>Earlier Changes in 1.0.9</h2>
     <ul>
       <li>New installations use the main AO3 FanFicFare route first. Upgrades preserve existing settings: set <code>prefer_native=false</code> and <code>prefer_ao3_mirror=false</code> under <code>[download]</code> to select this route. A site restriction can still prevent a download; this release does not bypass HTTP 403 or 525 errors.</li>
       <li>The updater no longer creates replacement <code>.new</code> files beside the live scripts, so a failed replacement does not leave those files behind. An update started with an older updater still uses that older updater's rollback behaviour.</li>
@@ -125,6 +131,10 @@
     <h2>Updates</h2>
     <p>The downloader checks GitHub no more than once every 24 hours. When a newer stable release is available, it offers to install it before continuing. <code>Update Fanfic Downloader.cmd</code> performs a manual check.</p>
     <p>Every update is staged and validated before installation. The updater requires a valid RSA-signed manifest, verifies the package SHA-256 hash, rejects undeclared or unsafe archive entries, backs up managed files, parse-checks PowerShell scripts, and rolls back a partial replacement. An update cannot declare <code>user</code> as a managed path.</p>
+
+    <h3>Recovering Filename History</h3>
+    <p>If startup says filename history could not be read, run <code>Update Fanfic Downloader.cmd</code> directly. The separate updater can run even when the downloader stops before its automatic update check.</p>
+    <p>Install 1.0.10 or later before retrying. The patch prevents further encoding damage, but does not repair existing damage. If startup still stops, close the downloader, move <code>user\filename-history.json</code> somewhere safe, and restore a known-good copy if available. Without a backup, the downloader starts a new history and can reuse names from matching EPUBs still in the output folder. Books that have already been moved out of that folder may get new filenames, and your reader may treat them as new books. Keep the moved history for possible recovery. Do not move or delete <code>user\failed-urls.txt</code>; it is a separate file.</p>
 
     <h2>Configuration</h2>
     <p>The supplied <code>downloader.example.ini</code> and <code>fanficfare.example.ini</code> files document the initial settings. The installer copies them into <code>user</code> only when the corresponding personal file does not already exist.</p>

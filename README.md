@@ -2,7 +2,12 @@
 
 Fanfic Downloader is an accessible Windows downloader and EPUB cleaner for Archive of Our Own, FanFiction.net, and FictionPress. It accepts supported links from the command line or clipboard, retries previously failed stories, and avoids duplicate queue entries when different chapters of the same story are supplied.
 
-## What's New in 1.0.9
+## What's New in 1.0.10
+
+- Filename history is read as UTF-8 on Windows PowerShell, so punctuation such as em dashes no longer becomes corrupted and grows the history on each save.
+- The downloader stops before loading a filename history larger than 16 MiB. It does not rewrite damaged history or remove anything from the failed-URL queue.
+
+## Earlier Changes in 1.0.9
 
 - New installations use the main AO3 FanFicFare route first. Upgrades preserve existing settings: set `prefer_native=false` and `prefer_ao3_mirror=false` under `[download]` to select this route. A site restriction can still prevent a download; this release does not bypass HTTP 403 or 525 errors.
 - The updater no longer creates replacement `.new` files beside the live scripts, so a failed replacement does not leave those files behind. An update started with an older updater still uses that older updater's rollback behaviour.
@@ -76,6 +81,12 @@ FicHub is a cache, not an independent source of AO3 updates. When AO3 denies acc
 The downloader checks GitHub no more than once every 24 hours. When a newer stable release is available, it offers to install it before continuing. `Update Fanfic Downloader.cmd` performs a manual check.
 
 Every update is staged and validated before installation. The updater requires a valid RSA-signed manifest, verifies the package SHA-256 hash, rejects undeclared or unsafe archive entries, backs up managed files, parse-checks PowerShell scripts, and rolls back a partial replacement. An update cannot declare `user` as a managed path.
+
+### Recovering Filename History
+
+If startup says filename history could not be read, run `Update Fanfic Downloader.cmd` directly. The separate updater can run even when the downloader stops before its automatic update check.
+
+Install 1.0.10 or later before retrying. The patch prevents further encoding damage, but does not repair existing damage. If startup still stops, close the downloader, move `user\filename-history.json` somewhere safe, and restore a known-good copy if available. Without a backup, the downloader starts a new history and can reuse names from matching EPUBs still in the output folder. Books that have already been moved out of that folder may get new filenames, and your reader may treat them as new books. Keep the moved history for possible recovery. Do not move or delete `user\failed-urls.txt`; it is a separate file.
 
 ## Configuration
 
